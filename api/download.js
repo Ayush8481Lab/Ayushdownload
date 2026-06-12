@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Clean quotes from variables so they don't interfere with our fluent-ffmpeg workaround
+        // Clean quotes from variables to ensure clean ID3 injection
         const songTitle = String(title || tittle || 'Unknown Title').replace(/["']/g, "").trim();
         const songArtist = String(artist || 'Unknown Artist').replace(/["']/g, "").trim();
         const songAlbum = String(album || 'Unknown Album').replace(/["']/g, "").trim();
@@ -53,35 +53,37 @@ module.exports = async (req, res) => {
             }
         }
 
-        let command = ffmpeg(url).audioBitrate('128k');
+        let command = ffmpeg(url);
 
-        // 2. Setup FFmpeg Metadata Options 
+        // 2. Setup strict FFmpeg MP3 encoding and Tagging Options
         let outputOptions = [
-            // CRITICAL FIX 1: Wipes the invisible blank tags from the M3U8 stream so Artist shows up
-            '-map_metadata', '-1', 
+            '-f', 'mp3',                 // FORCE format to MP3
+            '-c:a', 'libmp3lame',        // FORCE LAME MP3 Encoder (fixes AAC passthrough bug)
+            '-b:a', '128k',              // Set Audio Bitrate
+            '-map_metadata', '-1',       // Strip original HLS stream metadata entirely
+            '-id3v2_version', '3',       // Force ID3v2.3 (Required for Windows/Android/iOS)
+            '-write_id3v1', '1',         // Add ID3v1 fallback tags just in case
             
-            // CRITICAL FIX 2: Variables are wrapped in `" "` to stop the fluent-ffmpeg space crash
+            // Wrapped in quotes to strictly bypass fluent-ffmpeg's space-splitting crash
             '-metadata', `"title=${songTitle}"`,
             '-metadata', `"artist=${songArtist}"`,
             '-metadata', `"album_artist=${songArtist}"`,
             '-metadata', `"album=${songAlbum}"`
         ];
 
-        // 3. Attach Local Image IF downloaded successfully
+        // 3. Explicitly map streams to drop hidden HLS data
         if (hasImage) {
             command.input(imgPath);
             outputOptions.push(
-                '-map', '0:a',          
-                '-map', '1:v',          
-                '-c:v', 'mjpeg',        
-                '-id3v2_version', '3',   // Forces metadata to ID3v2.3 (Required for mobile phones)
-                '-metadata:s:v', '"title=Album_Cover"',  // Wrapped in quotes AND underscored just to be 1000% safe
-                '-metadata:s:v', '"comment=Cover_Front"',
+                '-map', '0:a:0',         // Map explicitly the FIRST audio track from M3U8
+                '-map', '1:v:0',         // Map explicitly the FIRST video track from the image
+                '-c:v', 'mjpeg',         // Convert image to standard jpeg
+                '-metadata:s:v', '"title=Album cover"', 
+                '-metadata:s:v', '"comment=Cover (front)"',
                 '-disposition:v', 'attached_pic' 
             );
         } else {
-            // Still enforce ID3v2.3 even if there's no image
-            outputOptions.push('-id3v2_version', '3');
+            outputOptions.push('-map', '0:a:0'); // Only pull the clean audio track
         }
 
         command.outputOptions(outputOptions);
@@ -89,6 +91,11 @@ module.exports = async (req, res) => {
         // 4. Save to disk first, THEN send to user
         command.save(outPath)
             .on('end', () => {
+                // EXTREMELY IMPORTANT: Prevent browser & Vercel from caching the old broken file!
+                res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+                res.setHeader('Pragma', 'no-cache');
+                res.setHeader('Expires', '0');
+                
                 res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
                 res.setHeader('Content-Type', 'audio/mpeg');
 
