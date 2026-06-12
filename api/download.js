@@ -1,4 +1,4 @@
-const ffmpeg = require('fluent-ffmpeg');
+ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
 const NodeID3 = require('node-id3');
