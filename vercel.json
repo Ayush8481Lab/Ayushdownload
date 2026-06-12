@@ -1,9 +1,0 @@
-{
-  "redirects": [
-    {
-      "source": "/api/download",
-      "destination": "/download",
-      "permanent": true
-    }
-  ]
-}
