@@ -16,7 +16,6 @@ try {
     console.error("Failed to setup FFmpeg in /tmp:", error);
 }
 
-// Helper: Converts time string "01:25.97" into milliseconds (85970) for ID3 Sync
 const convertTimeTagToMs = (timeTag) => {
     if (!timeTag) return 0;
     const parts = timeTag.split(':');
@@ -35,29 +34,25 @@ module.exports = async (req, res) => {
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Clean out any special characters
         const cleanStr = (str) => String(str).replace(/[=;#\\\n]/g, "").trim();
         const songTitle = cleanStr(title || tittle || 'Unknown Title');
         const songArtist = cleanStr(artist || 'Unknown Artist');
         const songAlbum = cleanStr(album || 'Unknown Album');
         
-        const outputFormat = 'mp3'; // Force MP3 (ID3 tags only apply to MP3s)
+        const outputFormat = 'mp3'; 
         const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
 
-        // DYNAMIC QUALITY EXTRACTOR
         let targetBitrate = '320k'; 
         const qualityMatch = url.match(/\/(\d+)\.mp4/);
         if (qualityMatch && qualityMatch[1]) {
             targetBitrate = `${qualityMatch[1]}k`; 
         }
 
-        // --- OPTIMIZATION 1: PARALLEL NETWORK REQUESTS ---
         const fetchTasks = [];
         let imageBuffer = null;
         let imageMime = 'image/jpeg';
         let lyricsData = null;
 
-        // Task A: Fetch Image
         if (imageUrl) {
             if (!imageUrl.startsWith('http')) imageUrl = 'https://' + imageUrl;
             fetchTasks.push(
@@ -75,7 +70,6 @@ module.exports = async (req, res) => {
             );
         }
 
-        // Task B: Fetch Lyrics
         if (trackid) {
             const lyricsUrl = `https://lyr-nine.vercel.app/api/lyrics?url=https://open.spotify.com/track/${trackid}&format=lrc`;
             fetchTasks.push(
@@ -86,15 +80,13 @@ module.exports = async (req, res) => {
             );
         }
 
-        // Wait for BOTH tasks concurrently (Cuts idle waiting time in half)
         await Promise.all(fetchTasks);
 
-        // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION ---
         const id3Tags = {
             title: songTitle,
             artist: songArtist,
             album: songAlbum,
-            performerInfo: songArtist // Maps to Album Artist
+            performerInfo: songArtist 
         };
 
         if (imageBuffer) {
@@ -108,7 +100,6 @@ module.exports = async (req, res) => {
 
         if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
             const rawText = lyricsData.lines.map(l => l.words).join('\n');
-            
             if (lyricsData.syncType === "LINE_SYNCED") {
                 id3Tags.synchronisedLyrics = [{
                     language: 'eng',
@@ -126,41 +117,60 @@ module.exports = async (req, res) => {
             };
         }
 
-        // Create the raw ID3v2 header buffer instantly (ZERO disk I/O)
         const id3HeaderBuffer = NodeID3.create(id3Tags);
 
-        // --- OPTIMIZATION 3: INSTANT STREAMING ---
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
         res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // Send the ID3 Tag Header immediately so the client starts downloading < 1 second!
+        // Send ID3 tags instantly
         res.write(id3HeaderBuffer);
+        
+        // SPEED HACK: Force Node to push headers to the browser right now.
+        // This triggers the browser's "Save As" popup instantly without waiting for FFmpeg.
+        if (res.flushHeaders) res.flushHeaders(); 
 
-        // Run FFmpeg & Pipe purely Raw Audio data right behind the ID3 tag
         ffmpeg(url)
+            .inputOptions([
+                // SPEED HACK 1: Stop FFmpeg from analyzing the whole stream before starting
+                '-probesize', '32768',       // Reduce probe size to the bare minimum (32KB)
+                '-analyzeduration', '0',     // Tell FFmpeg to start instantly (0 delay)
+                
+                // Network stability flags
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '2'
+            ])
             .outputOptions([
-                '-vn',                   // Skip cover art in FFmpeg (We already injected it in the ID3 Header!)
-                '-f', 'mp3',             // Force raw MP3 stream out
-                '-c:a', 'libmp3lame',    // MP3 encoder
-                '-b:a', targetBitrate,   // Quality enforcement
-                '-map_metadata', '-1',   // Strip original M3U8 metadata so it doesn't conflict with our ID3 header
-                '-threads', '0'          // Use all available CPU cores for decoding
+                '-vn',                   
+                '-f', 'mp3',             
+                '-c:a', 'libmp3lame',    
+                '-b:a', targetBitrate,   
+                
+                // SPEED HACK 2: Tell LAME encoder to use its absolute fastest algorithm
+                // (0 = fastest, 9 = slowest). It uses much less CPU, making downloads incredibly fast.
+                '-compression_level', '0', 
+                
+                '-map_metadata', '-1',   
+                '-threads', '0',         
+                
+                // SPEED HACK 3: Push output packets instantly instead of waiting for large chunks
+                '-flush_packets', '1'    
             ])
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
                 if (!res.writableEnded) res.end();
             })
-            // Pipes the audio chunks continuously, automatically closing the connection when done.
+            // Pipe output. The stream is sent to the user piece-by-piece at max speed
             .pipe(res, { end: true });
 
     } catch (err) {
         if (!res.headersSent) {
             res.status(500).json({ error: "API Crashed", details: err.message });
         } else {
-            res.end(); // Fail gracefully if stream already started
+            res.end(); 
         }
     }
 };
