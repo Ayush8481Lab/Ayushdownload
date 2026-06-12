@@ -16,7 +16,7 @@ try {
     console.error("Failed to setup FFmpeg in /tmp:", error);
 }
 
-// Helper: Converts time string "01:25.97" into milliseconds (85970) for ID3 Sync
+// Helper: Converts time string "01:25.97" into milliseconds
 const convertTimeTagToMs = (timeTag) => {
     if (!timeTag) return 0;
     const parts = timeTag.split(':');
@@ -26,6 +26,13 @@ const convertTimeTagToMs = (timeTag) => {
         return Math.floor((minutes * 60 + seconds) * 1000);
     }
     return 0;
+};
+
+// Helper: Converts MS to standard LRC "mm:ss.xx" tag
+const formatTimeMsToTag = (ms) => {
+    const min = Math.floor(ms / 60000);
+    const sec = ((ms % 60000) / 1000).toFixed(2);
+    return `${min < 10 ? '0' : ''}${min}:${sec < 10 ? '0' : ''}${sec}`;
 };
 
 module.exports = async (req, res) => {
@@ -41,10 +48,12 @@ module.exports = async (req, res) => {
         const songArtist = cleanStr(artist || 'Unknown Artist');
         const songAlbum = cleanStr(album || 'Unknown Album');
         
-        const outputFormat = 'mp3'; // Force MP3 (ID3 tags only apply to MP3s)
-        const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
+        const outputFormat = 'mp3'; 
+        
+        // CACHE-BUSTING: Add a random ID to the filename so Android MediaStore is FORCED to re-scan the ID3 tags!
+        const uniqueId = Math.floor(Math.random() * 10000);
+        const safeFileName = `${songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_")}_${uniqueId}`;
 
-        // DYNAMIC QUALITY EXTRACTOR
         let targetBitrate = '320k'; 
         const qualityMatch = url.match(/\/(\d+)\.mp4/);
         if (qualityMatch && qualityMatch[1]) {
@@ -57,7 +66,6 @@ module.exports = async (req, res) => {
         let imageMime = 'image/jpeg';
         let lyricsData = null;
 
-        // Task A: Fetch Image
         if (imageUrl) {
             if (!imageUrl.startsWith('http')) imageUrl = 'https://' + imageUrl;
             fetchTasks.push(
@@ -75,7 +83,6 @@ module.exports = async (req, res) => {
             );
         }
 
-        // Task B: Fetch Lyrics
         if (trackid) {
             const lyricsUrl = `https://lyr-nine.vercel.app/api/lyrics?url=https://open.spotify.com/track/${trackid}&format=lrc`;
             fetchTasks.push(
@@ -86,7 +93,6 @@ module.exports = async (req, res) => {
             );
         }
 
-        // Wait for BOTH tasks concurrently
         await Promise.all(fetchTasks);
 
         // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION ---
@@ -106,40 +112,59 @@ module.exports = async (req, res) => {
             };
         }
 
-        // LYRICS FIX FOR MI MUSIC PLAYER AND OEM APPS
+        // --- THE DEEP LYRICS FIX ---
         if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
-            let lrcText = "";
+            
+            // 1. Mandatory metadata headers required by Mi Music & Android offline parsers
+            let lrcText = `[ti:${songTitle}]\r\n[ar:${songArtist}]\r\n[al:${songAlbum}]\r\n`;
             let plainText = "";
             const syncLyrics = [];
 
             lyricsData.lines.forEach(l => {
-                plainText += l.words + '\n';
+                let textLine = (l.words || l.text || "").trim();
+                
+                // Native parsers strictly require \r\n (Carriage Return + Line Feed)
+                plainText += textLine + '\r\n';
+                
+                // Fallback calculations for timing just in case the API omits the timeTag
+                let ms = 0;
+                let timeStr = "";
+
                 if (l.timeTag) {
-                    // Recreate LRC format strictly eg: [01:25.97]Lyrics text here
-                    lrcText += `[${l.timeTag}]${l.words}\n`;
+                    timeStr = l.timeTag;
+                    ms = convertTimeTagToMs(l.timeTag);
+                } else if (l.startTimeMs) {
+                    ms = parseInt(l.startTimeMs, 10);
+                    timeStr = formatTimeMsToTag(ms);
+                }
+
+                if (timeStr && ms > 0) {
+                    lrcText += `[${timeStr}]${textLine}\r\n`;
                     syncLyrics.push({
-                        text: l.words,
-                        timeStamp: convertTimeTagToMs(l.timeTag)
+                        text: textLine,
+                        timeStamp: ms
                     });
                 }
             });
 
-            if (lyricsData.syncType === "LINE_SYNCED" && syncLyrics.length > 0) {
-                // 1. Mi Music looks for the .LRC parsed string directly inside the USLT tag
+            if (syncLyrics.length > 0) {
+                // PRIMARY: The main lyrics tag Mi Music natively defaults to
                 id3Tags.unsynchronisedLyrics = {
                     language: 'eng',
+                    description: '', // CRITICAL: Leaving this strictly empty forces it to be the "Default" lyric frame
                     text: lrcText.trim()
                 };
 
-                // 2. Standard SYLT (For players that natively support the binary synced tag)
+                // SECONDARY: Standard binary SYLT tag (for advanced players)
                 id3Tags.synchronisedLyrics = [{
                     language: 'eng',
-                    timeStampFormat: 2,
-                    contentType: 1,
+                    timeStampFormat: 2, 
+                    contentType: 1,     
+                    shortText: '',
                     synchronisedText: syncLyrics
                 }];
 
-                // 3. Fallback for players that strictly read custom TXXX:LYRICS
+                // TERTIARY: TXXX Fallback for older OEM Android music players
                 id3Tags.userDefinedText = [{
                     description: 'LYRICS',
                     value: lrcText.trim()
@@ -147,12 +172,13 @@ module.exports = async (req, res) => {
             } else {
                 id3Tags.unsynchronisedLyrics = {
                     language: 'eng',
+                    description: '',
                     text: plainText.trim()
                 };
             }
         }
 
-        // Create the raw ID3v2 header buffer instantly (ZERO disk I/O)
+        // Create the raw ID3v2 header buffer
         const id3HeaderBuffer = NodeID3.create(id3Tags);
 
         // --- OPTIMIZATION 3: INSTANT STREAMING ---
@@ -162,20 +188,20 @@ module.exports = async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // Prepend our properly formatted ID3 tag right at the front!
+        // Prepend properly formatted ID3 tag right at the front
         res.write(id3HeaderBuffer);
 
-        // Run FFmpeg & Pipe purely Raw Audio data
+        // Run FFmpeg & Pipe Pure Audio Data
         ffmpeg(url)
             .outputOptions([
-                '-vn',                   // Skip cover art in FFmpeg (We handled it above)
+                '-vn',                   // Skip cover art in FFmpeg (Handled natively)
                 '-f', 'mp3',             // Force raw MP3 stream out
                 '-c:a', 'libmp3lame',    // MP3 encoder
                 '-b:a', targetBitrate,   // Quality enforcement
                 '-map_metadata', '-1',   // Strip original metadata
-                '-write_id3v2', '0',     // 🚫 CRITICAL FIX: Prevent FFmpeg from generating a duplicate ID3v2 tag!
-                '-id3v2_version', '0',   // 🚫 Ensures no empty metadata header hides your injected ID3
-                '-threads', '0'          // Use all available CPU cores for decoding
+                '-write_id3v2', '0',     // 🚫 Block FFmpeg from writing overlapping ID3v2 tag
+                '-write_id3v1', '0',     // 🚫 Block FFmpeg from writing ID3v1 trailing tag
+                '-threads', '0'          // Multi-threading
             ])
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
@@ -187,7 +213,7 @@ module.exports = async (req, res) => {
         if (!res.headersSent) {
             res.status(500).json({ error: "API Crashed", details: err.message });
         } else {
-            res.end(); // Fail gracefully if stream already started
+            res.end();
         }
     }
 };
