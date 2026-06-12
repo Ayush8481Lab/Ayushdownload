@@ -22,10 +22,10 @@ module.exports = async (req, res) => {
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Set Metadata
-        const songTitle = String(title || tittle || 'Unknown Title');
-        const songArtist = String(artist || 'Unknown Artist');
-        const songAlbum = String(album || 'Unknown Album');
+        // Set Metadata & clean any raw double quotes that could break fluent-ffmpeg's regex workaround
+        const songTitle = String(title || tittle || 'Unknown Title').replace(/"/g, '');
+        const songArtist = String(artist || 'Unknown Artist').replace(/"/g, '');
+        const songAlbum = String(album || 'Unknown Album').replace(/"/g, '');
         const outputFormat = String(format || 'mp3');
         const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
 
@@ -36,7 +36,7 @@ module.exports = async (req, res) => {
         
         let hasImage = false;
 
-        // 1. Download the Image manually by pretending to be Google Chrome (Bypasses Blocks)
+        // 1. Download the Image manually by pretending to be Google Chrome
         if (imageUrl) {
             if (!imageUrl.startsWith('http')) imageUrl = 'https://' + imageUrl;
             try {
@@ -56,11 +56,12 @@ module.exports = async (req, res) => {
         // 2. Setup FFmpeg Metadata Options
         let command = ffmpeg(url).audioBitrate('128k');
 
+        // FIXED: Wrap variables natively in double-quotes to bypass `fluent-ffmpeg` spacing bug
         let outputOptions = [
-            '-metadata', `title=${songTitle}`,
-            '-metadata', `artist=${songArtist}`,
-            '-metadata', `album_artist=${songArtist}`,
-            '-metadata', `album=${songAlbum}`
+            '-metadata', `"title=${songTitle}"`,
+            '-metadata', `"artist=${songArtist}"`,
+            '-metadata', `"album_artist=${songArtist}"`,
+            '-metadata', `"album=${songAlbum}"`
         ];
 
         // 3. Attach Local Image IF downloaded successfully
@@ -71,8 +72,8 @@ module.exports = async (req, res) => {
                 '-map', '1:v',          // Map Image
                 '-c:v', 'mjpeg',        // Convert image to jpeg
                 '-id3v2_version', '3',  // Crucial for mobile phones
-                '-metadata:s:v', 'title="Album cover"', 
-                '-metadata:s:v', 'comment="Cover (front)"',
+                '-metadata:s:v', '"title=Album cover"',   // FIXED: Wraps entire argument string in quotes
+                '-metadata:s:v', '"comment=Cover (front)"', // FIXED: Wraps entire argument string in quotes
                 '-disposition:v', 'attached_pic' // Tag as cover
             );
         }
