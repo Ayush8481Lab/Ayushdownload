@@ -16,6 +16,18 @@ try {
     console.error("Failed to setup FFmpeg in /tmp:", error);
 }
 
+// Helper: Converts time string "01:25.97" into milliseconds (85970) for ID3 Sync
+const convertTimeTagToMs = (timeTag) => {
+    if (!timeTag) return 0;
+    const parts = timeTag.split(':');
+    if (parts.length >= 2) {
+        const minutes = parseInt(parts[0], 10);
+        const seconds = parseFloat(parts[1]);
+        return Math.floor((minutes * 60 + seconds) * 1000);
+    }
+    return 0;
+};
+
 module.exports = async (req, res) => {
     try {
         let { url, format, imageUrl, title, tittle, artist, album, trackid } = req.query;
@@ -23,26 +35,23 @@ module.exports = async (req, res) => {
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Clean out any special characters
         const cleanStr = (str) => String(str).replace(/[=;#\\\n]/g, "").trim();
         const songTitle = cleanStr(title || tittle || 'Unknown Title');
         const songArtist = cleanStr(artist || 'Unknown Artist');
         const songAlbum = cleanStr(album || 'Unknown Album');
         
-        // CRITICAL FIX: Add a unique timestamp to the filename!
-        // Android caches broken lyrics. This forces Android to scan the new lyrics perfectly.
+        // UNIQUE FILENAME: Defeats Android's aggressive lyrics caching
         const outputFormat = 'mp3'; 
         const baseName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio";
         const safeFileName = `${baseName}_${Date.now()}`;
 
-        // DYNAMIC QUALITY EXTRACTOR
         let targetBitrate = '320k'; 
         const qualityMatch = url.match(/\/(\d+)\.mp4/);
         if (qualityMatch && qualityMatch[1]) {
             targetBitrate = `${qualityMatch[1]}k`; 
         }
 
-        // --- FETCH IMAGES & LYRICS ---
+        // --- CONCURRENT NETWORK FETCH ---
         const fetchTasks = [];
         let imageBuffer = null;
         let imageMime = 'image/jpeg';
@@ -57,7 +66,6 @@ module.exports = async (req, res) => {
                             const contentType = imgRes.headers.get('content-type') || '';
                             if (contentType.includes('webp')) imageMime = 'image/webp';
                             else if (contentType.includes('png')) imageMime = 'image/png';
-                            
                             imageBuffer = Buffer.from(await imgRes.arrayBuffer());
                         }
                     }).catch(e => console.error("Image fetch failed", e))
@@ -76,12 +84,22 @@ module.exports = async (req, res) => {
 
         await Promise.all(fetchTasks);
 
-        // --- ID3 CONSTRUCTION ---
+        // --- ID3 & DURATION (TIMELINE) CONSTRUCTION ---
+        let durationMs = 180000; // Fallback to 3 minutes
+        if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
+            // Find the last lyric timestamp and add 15 seconds to estimate Track Length
+            const lastLine = lyricsData.lines[lyricsData.lines.length - 1];
+            if (lastLine && lastLine.timeTag) {
+                durationMs = convertTimeTagToMs(lastLine.timeTag) + 15000;
+            }
+        }
+
         const id3Tags = {
             title: songTitle,
             artist: songArtist,
             album: songAlbum,
-            performerInfo: songArtist
+            performerInfo: songArtist,
+            length: durationMs.toString() // CRITICAL: Gives Android the exact timeline so lyrics activate!
         };
 
         if (imageBuffer) {
@@ -93,43 +111,51 @@ module.exports = async (req, res) => {
             };
         }
 
-        // ==========================================
-        // 🔥 MI MUSIC LYRICS ENGINE 🔥
-        // ==========================================
+        // --- PERFECT LRC INJECTION ---
         if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
             
-            // Build the PERFECT standard LRC script with \r\n line breaks
             const lrcLines = [];
             lrcLines.push(`[ti:${songTitle}]`);
             lrcLines.push(`[ar:${songArtist}]`);
             lrcLines.push(`[al:${songAlbum}]`);
             
             lyricsData.lines.forEach(l => {
-                const time = l.timeTag ? `[${l.timeTag}]` : '[00:00.00]';
-                const words = l.words ? l.words.trim() : '♪'; // Add musical note to keep parser active
-                lrcLines.push(`${time}${words}`);
+                if (l.timeTag) {
+                    const text = l.words ? l.words.trim() : ' '; // Space prevents parser crash on empty lines
+                    lrcLines.push(`[${l.timeTag}]${text}`);
+                }
             });
 
-            const lrcText = lrcLines.join('\r\n');
+            const lrcText = lrcLines.join('\n');
 
-            // 1. Primary Android LRC location (Using 'eng' standard code)
+            // 1. Unsynchronised Lyrics (Primary for Mi Music / Chinese OEMs)
             id3Tags.unsynchronisedLyrics = {
-                language: 'eng', 
+                language: 'eng',
                 shortText: '',
                 text: lrcText
             };
 
-            // 2. Secret Xiaomi/Huawei fallback frame
+            // 2. Custom Frame (Specific fallback for strict Asian players)
             id3Tags.userDefinedText = [{
                 description: 'LYRICS',
                 value: lrcText
             }];
 
-            // NOTE: We INTENTIONALLY deleted the SYLT (synchronisedLyrics) frame! 
-            // It was causing Mi Music to crash entirely.
+            // 3. Official Synchronised Frame (For modern Global players)
+            if (lyricsData.syncType === "LINE_SYNCED") {
+                id3Tags.synchronisedLyrics = [{
+                    language: 'eng',
+                    timeStampFormat: 2,
+                    contentType: 1,
+                    synchronisedText: lyricsData.lines.filter(l => l.timeTag).map(l => ({
+                        text: l.words ? l.words.trim() : ' ',
+                        timeStamp: convertTimeTagToMs(l.timeTag)
+                    }))
+                }];
+            }
         }
 
-        // Generate buffer instantly
+        // Create buffer instantly
         const id3HeaderBuffer = NodeID3.create(id3Tags);
 
         // --- INSTANT STREAMING ---
@@ -142,16 +168,19 @@ module.exports = async (req, res) => {
         // Send perfectly crafted ID3 tag first
         res.write(id3HeaderBuffer);
 
-        // Stream FFmpeg Audio bytes safely
+        // Run FFmpeg & Pipe purely Raw Audio
         ffmpeg(url)
             .outputOptions([
-                '-vn',                   
-                '-f', 'mp3',             
-                '-c:a', 'libmp3lame',    
-                '-b:a', targetBitrate,   
-                '-map_metadata', '-1',   
-                '-write_id3v2', '0',     // 🚨 CRITICAL FIX: Stops FFmpeg from generating a second, empty ID3 tag that ruins your lyrics!
-                '-threads', '0'          
+                '-vn',                   // Skip cover art in FFmpeg 
+                '-f', 'mp3',             // Force raw MP3 stream out
+                '-c:a', 'libmp3lame',    // MP3 encoder
+                '-b:a', targetBitrate,   // Enforce Bitrate
+                '-minrate', targetBitrate, // STRICT CBR: Helps Android map the timeline bytes
+                '-maxrate', targetBitrate, // STRICT CBR
+                '-map_metadata', '-1',   // Strip original M3U8 metadata
+                '-write_id3v2', '0',     // Prevents FFmpeg from double-tagging
+                '-write_xing', '0',      // CRITICAL FIX: Disables broken streaming header
+                '-threads', '0'          // Use all available CPU cores
             ])
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
