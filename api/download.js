@@ -3,35 +3,48 @@ const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
 const crypto = require('crypto');
 
-// VERCEL HACK: Copy FFmpeg to /tmp and give it execute permissions
+// VERCEL HACK: Safely setup FFmpeg path with a fallback
 const tmpFfmpegPath = '/tmp/ffmpeg';
-
 try {
     if (!fs.existsSync(tmpFfmpegPath)) {
         fs.copyFileSync(ffmpegPath, tmpFfmpegPath);
-        fs.chmodSync(tmpFfmpegPath, 0o755); 
+        fs.chmodSync(tmpFfmpegPath, 0o755);
     }
     ffmpeg.setFfmpegPath(tmpFfmpegPath);
 } catch (error) {
-    console.error("Failed to setup FFmpeg in /tmp:", error);
+    console.error("Failed to setup FFmpeg in /tmp, using default node_modules path:", error);
+    ffmpeg.setFfmpegPath(ffmpegPath); // Fallback if /tmp copy fails
 }
 
 module.exports = async (req, res) => {
+    let command; // Reference to kill ffmpeg if the user cancels download
+    let hasCover = false;
+    const coverId = crypto.randomBytes(4).toString('hex');
+    const coverPath = `/tmp/cover_${coverId}.jpg`;
+
+    const cleanup = () => {
+        if (hasCover && fs.existsSync(coverPath)) {
+            try { fs.unlinkSync(coverPath); } catch (e) {}
+        }
+        if (command) {
+            try { command.kill('SIGKILL'); } catch (e) {} // Stop zombie processes saving Vercel memory
+        }
+    };
+
     try {
         let { url, format, imageUrl, title, tittle, artist, album, trackid } = req.query;
 
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Clean out any special characters
-        const cleanStr = (str) => String(str).replace(/[=;#\\\n]/g, "").trim();
+        // FIX: Removed '"' and ',' from names to prevent HTTP Header crashes
+        const cleanStr = (str) => String(str).replace(/[=;#\\\"\n\r,]/g, "").trim();
         const songTitle = cleanStr(title || tittle || 'Unknown Title');
         const songArtist = cleanStr(artist || 'Unknown Artist');
         const songAlbum = cleanStr(album || 'Unknown Album');
         
         const outputFormat = 'mp3'; 
         const baseName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio";
-        // Force Android to scan the file as a brand new song (defeats cached "No lyrics" bugs)
         const safeFileName = `${baseName}_${crypto.randomBytes(2).toString('hex')}`;
 
         // DYNAMIC QUALITY EXTRACTOR
@@ -44,7 +57,7 @@ module.exports = async (req, res) => {
         // --- FETCH DATA CONCURRENTLY ---
         const fetchTasks = [];
         let imageBuffer = null;
-        let lyricsData = null;
+        let lrcText = ''; // Defined properly up here
 
         // Fetch Cover Art
         if (imageUrl) {
@@ -63,7 +76,26 @@ module.exports = async (req, res) => {
             fetchTasks.push(
                 fetch(lyricsUrl)
                     .then(async lyrRes => {
-                        if (lyrRes.ok) lyricsData = await lyrRes.json();
+                        if (!lyrRes.ok) return;
+                        const textData = await lyrRes.text();
+                        
+                        try {
+                            // First, try parsing it as JSON
+                            const json = JSON.parse(textData);
+                            if (json && json.lines && json.lines.length > 0) {
+                                lrcText = `[ti:${songTitle}]\n[ar:${songArtist}]\n[al:${songAlbum}]\n`;
+                                lrcText += json.lines.map(l => {
+                                    const time = l.timeTag ? `[${l.timeTag}]` : '[00:00.00]';
+                                    const words = l.words ? l.words.trim() : ' ';
+                                    return `${time}${words}`;
+                                }).join('\n');
+                            } else if (json && json.lyrics) {
+                                lrcText = json.lyrics; // Fallback for simple lyrics JSON
+                            }
+                        } catch (err) {
+                            // FIX: If JSON parse fails, the API actually sent raw LRC plain-text! 
+                            lrcText = textData;
+                        }
                     }).catch(e => console.error("Lyrics fetch failed", e))
             );
         }
@@ -71,31 +103,9 @@ module.exports = async (req, res) => {
         await Promise.all(fetchTasks);
 
         // --- PREPARE IMAGE ATTACHMENT ---
-        const coverId = crypto.randomBytes(4).toString('hex');
-        const coverPath = `/tmp/cover_${coverId}.jpg`;
-        let hasCover = false;
-
         if (imageBuffer) {
             fs.writeFileSync(coverPath, imageBuffer);
             hasCover = true;
-        }
-
-        const cleanup = () => {
-            if (hasCover && fs.existsSync(coverPath)) {
-                try { fs.unlinkSync(coverPath); } catch (e) {}
-            }
-        };
-
-        // --- PREPARE LRC FORMAT ATTACHMENT ---
-        let lrcText = '';
-        if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
-            // Strictly formatted LRC layout
-            lrcText += `[ti:${songTitle}]\n[ar:${songArtist}]\n[al:${songAlbum}]\n`;
-            lrcText += lyricsData.lines.map(l => {
-                const time = l.timeTag ? `[${l.timeTag}]` : '[00:00.00]';
-                const words = l.words ? l.words.trim() : ' '; // Blank space prevents Android parser from crashing
-                return `${time}${words}`;
-            }).join('\n');
         }
 
         // --- INSTANT STREAMING ---
@@ -104,17 +114,25 @@ module.exports = async (req, res) => {
         res.setHeader('Content-Type', 'audio/mpeg');
 
         res.on('finish', cleanup);
-        res.on('close', cleanup);
+        res.on('close', cleanup); // Kills FFmpeg if user pauses/cancels download
 
         // --- FFMPEG PACKAGER PIPELINE ---
-        const command = ffmpeg();
+        command = ffmpeg();
         command.input(url);
         
+        // FIX: Add network stability flags to stop the M3U8 download from failing
+        command.inputOptions([
+            '-headers', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n',
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5'
+        ]);
+
         const outputOptions = [
             '-f', 'mp3',
             '-c:a', 'libmp3lame',
             '-b:a', targetBitrate,
-            '-minrate', targetBitrate, // CBR mode makes Mi Music timeline mapping flawless
+            '-minrate', targetBitrate, 
             '-maxrate', targetBitrate, 
             '-metadata', `title=${songTitle}`,
             '-metadata', `artist=${songArtist}`,
@@ -157,6 +175,7 @@ module.exports = async (req, res) => {
 
     } catch (err) {
         console.error('API Error:', err);
+        cleanup();
         if (!res.headersSent) {
             res.status(500).json({ error: "API Crashed", details: err.message });
         } else {
