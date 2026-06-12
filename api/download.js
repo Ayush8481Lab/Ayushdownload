@@ -6,74 +6,81 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 module.exports = (req, res) => {
     try {
-        // Grab all the new parameters from your URL
-        let { url, format, imageUrl, artist, album, tittle, title } = req.query;
+        // 1. Grab parameters safely (force them to be strings to prevent TypeErrors)
+        let url = req.query.url ? String(req.query.url) : '';
+        let format = req.query.format ? String(req.query.format) : 'mp3';
+        let imageUrl = req.query.imageUrl ? String(req.query.imageUrl) : '';
+        
+        let title = req.query.title || req.query.tittle || 'Unknown Title';
+        let artist = req.query.artist || 'Unknown Artist';
+        let album = req.query.album || 'Unknown Album';
 
-        // Fallbacks just in case a parameter is missing
-        const songTitle = title || tittle || 'Unknown Title';
-        const songArtist = artist || 'Unknown Artist';
-        const songAlbum = album || 'Unknown Album';
+        // Force text to be strings
+        title = String(title);
+        artist = String(artist);
+        album = String(album);
 
         if (!url) {
             return res.status(400).json({ error: "Please provide an M3U8 url parameter" });
         }
 
-        // Ensure URLs have https://
-        if (!url.startsWith('http')) url = 'https://' + url;
+        // Fix M3U8 URL if it misses https
+        if (!url.startsWith('http')) {
+            url = 'https://' + url;
+        }
 
-        // Clean the filename so it doesn't break browser downloads (removes special chars)
-        const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_");
+        // Create a safe file name without special characters to prevent download errors
+        const safeFileName = title.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio";
 
-        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${format || 'mp3'}"`);
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${format}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // 1. Setup the main audio stream
-        let command = ffmpeg().input(url);
+        // 2. Setup FFmpeg Command
+        let command = ffmpeg(url).format(format).audioBitrate('128k');
+        
+        // Setup Text Metadata
+        let outputOptions = [
+            '-metadata', `title=${title}`,
+            '-metadata', `artist=${artist}`,
+            '-metadata', `album=${album}`
+        ];
 
-        // 2. Set Format and Quality
-        command.format(format || 'mp3').audioBitrate('128k');
-
-        let outputOptions = [];
-
-        // 3. Add the ID3 Text Metadata (Title, Artist, Album)
-        outputOptions.push('-metadata', `title=${songTitle}`);
-        outputOptions.push('-metadata', `artist=${songArtist}`);
-        outputOptions.push('-metadata', `album=${songAlbum}`);
-
-        // 4. Add the Cover Art Image!
-        if (imageUrl) {
-            if (!imageUrl.startsWith('http')) imageUrl = 'https://' + imageUrl;
-            
-            // Add the image as a secondary input
+        // 3. SAFE Image Handling (Only process if it's a real HTTP link)
+        if (imageUrl && imageUrl.startsWith('http')) {
             command.input(imageUrl);
-            
-            // Map the audio and image together into a single file
             outputOptions.push(
-                '-map', '0:a',          // Take audio from the 1st input (M3U8)
-                '-map', '1:v',          // Take image from the 2nd input (ImageUrl)
-                '-c:v', 'mjpeg',        // Convert image to standard jpeg inside the mp3
-                '-id3v2_version', '3',  // Use ID3v2.3 (Highest compatibility for mobile phones)
-                '-disposition:v', 'attached_pic' // Tell the MP3 player this is Cover Art!
+                '-map', '0:a',          // Map Audio
+                '-map', '1:v',          // Map Video/Image
+                '-c:v', 'mjpeg',        // Compress image to standard JPEG
+                '-id3v2_version', '3',  // Use ID3v2.3 (Highest mobile compatibility)
+                '-disposition:v', 'attached_pic' // Tag as Cover Art
             );
+        } else if (imageUrl) {
+            console.log("Ignored invalid image URL:", imageUrl);
         }
 
-        // Apply all our custom options to FFmpeg
-        if (outputOptions.length > 0) {
-            command.outputOptions(outputOptions);
-        }
+        command.outputOptions(outputOptions);
 
-        // 5. Run the conversion and pipe directly to the user
+        // 4. Safe Error Handling
         command.on('error', (err) => {
-            console.error('FFmpeg Error:', err.message);
+            console.error('FFmpeg processing error:', err.message);
+            // If headers are not sent, send a JSON error. Otherwise, end the stream safely.
             if (!res.headersSent) {
-                res.status(500).json({ error: "Conversion failed", details: err.message });
+                res.status(500).json({ error: 'FFmpeg failed to process', details: err.message });
+            } else {
+                res.end();
             }
-        })
-        .pipe(res, { end: true });
+        });
 
-    } catch (error) {
+        // 5. Pipe to Mobile Phone
+        command.pipe(res, { end: true });
+
+    } catch (err) {
+        console.error('Server crash avoided:', err);
         if (!res.headersSent) {
-            res.status(500).json({ error: "System crash", details: error.message });
+            res.status(500).json({ error: 'API Error', details: err.message });
+        } else {
+            res.end();
         }
     }
 };
