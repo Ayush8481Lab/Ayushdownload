@@ -1,37 +1,50 @@
 const ffmpeg = require('fluent-ffmpeg');
-const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const fs = require('fs');
 
-// Safely tell fluent-ffmpeg where the Vercel-compatible binary is
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+// VERCEL HACK: Copy FFmpeg to /tmp and give it execute permissions
+const tmpFfmpegPath = '/tmp/ffmpeg';
+
+try {
+    if (!fs.existsSync(tmpFfmpegPath)) {
+        fs.copyFileSync(ffmpegPath, tmpFfmpegPath);
+        fs.chmodSync(tmpFfmpegPath, 0o755); // 0755 grants execution rights
+    }
+    ffmpeg.setFfmpegPath(tmpFfmpegPath);
+} catch (error) {
+    console.error("Failed to setup FFmpeg in /tmp:", error);
+}
 
 module.exports = (req, res) => {
+    let { url, format } = req.query;
+
+    if (!url) {
+        return res.status(400).json({ error: "Missing M3U8 url parameter" });
+    }
+
+    // Ensure URL has https://
+    if (!url.startsWith('http')) {
+        url = 'https://' + url;
+    }
+
+    // Set headers to trigger an MP3 file download on mobile
+    res.setHeader('Content-Disposition', `attachment; filename="audio.${format || 'mp3'}"`);
+    res.setHeader('Content-Type', 'audio/mpeg');
+
     try {
-        let { url, format } = req.query;
-
-        if (!url) {
-            return res.status(400).json({ error: "Please provide an M3U8 url parameter" });
-        }
-
-        if (!url.startsWith('http')) {
-            url = 'https://' + url;
-        }
-
-        res.setHeader('Content-Disposition', `attachment; filename="audio.${format || 'mp3'}"`);
-        res.setHeader('Content-Type', 'audio/mpeg');
-
+        // Run FFmpeg
         ffmpeg(url)
             .format(format || 'mp3')
-            .audioBitrate('128k')
+            .audioBitrate('128k') // 128k keeps processing fast to beat the 60s timeout
             .on('error', (err) => {
-                console.error('FFmpeg Error:', err.message);
+                console.error('FFmpeg Conversion Error:', err.message);
                 if (!res.headersSent) {
-                    res.status(500).json({ error: "Conversion failed", details: err.message });
+                    res.status(500).json({ error: "FFmpeg Failed", details: err.message });
                 }
             })
-            .pipe(res, { end: true });
+            .pipe(res, { end: true }); // Stream directly to the user
 
-    } catch (error) {
-        // This prevents the whole Vercel function from crashing!
-        res.status(500).json({ error: "System crash", details: error.message });
+    } catch (err) {
+        res.status(500).json({ error: "API Crashed", details: err.message });
     }
 };
