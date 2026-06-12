@@ -31,15 +31,23 @@ module.exports = async (req, res) => {
         const outputFormat = String(format || 'mp3');
         const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
 
+        // --- NEW: DYNAMIC QUALITY EXTRACTOR ---
+        // Reads the original quality (320, 128, 64, 16) directly from your Gaana M3U8 URL
+        let targetBitrate = '320k'; // Default to maximum quality if no number is found
+        const qualityMatch = url.match(/\/(\d+)\.mp4/);
+        if (qualityMatch && qualityMatch[1]) {
+            targetBitrate = `${qualityMatch[1]}k`; // Automatically becomes '320k', '128k', etc.
+        }
+
         // Unique IDs for all our temporary files
         const sessionId = Date.now() + Math.floor(Math.random() * 1000);
         const outPath = `/tmp/output_${sessionId}.${outputFormat}`;
         const imgPath = `/tmp/image_${sessionId}.jpg`;
-        const metaPath = `/tmp/meta_${sessionId}.txt`; // Our new text file for bulletproof metadata
+        const metaPath = `/tmp/meta_${sessionId}.txt`; 
         
         let hasImage = false;
 
-        // 1. Create the bulletproof FFMETADATA text file (Bypasses all fluent-ffmpeg space/quote bugs)
+        // 1. Create the bulletproof FFMETADATA text file
         const metaContent = `;FFMETADATA1\ntitle=${songTitle}\nartist=${songArtist}\nalbum_artist=${songArtist}\nalbum=${songAlbum}\n`;
         fs.writeFileSync(metaPath, metaContent);
 
@@ -60,35 +68,35 @@ module.exports = async (req, res) => {
             }
         }
 
-        let command = ffmpeg(url); // Input 0: The M3U8 Stream
+        let command = ffmpeg(url); 
 
-        // 3. Setup strict FFmpeg MP3 encoding Options (NO METADATA ARGUMENTS HERE!)
+        // 3. Setup strict FFmpeg MP3 encoding Options
         let outputOptions = [
-            '-f', 'mp3',                 // FORCE format to MP3
-            '-c:a', 'libmp3lame',        // FORCE LAME MP3 Encoder
-            '-b:a', '128k',              // Set Audio Bitrate
-            '-id3v2_version', '3',       // Force ID3v2.3 (Required for Windows/Android/iOS)
-            '-write_id3v1', '1'          // Add ID3v1 fallback tags
+            '-f', 'mp3',                 
+            '-c:a', 'libmp3lame',        
+            '-b:a', targetBitrate,       // NEW: Enforces the EXACT original bitrate extracted from URL
+            '-id3v2_version', '3',       
+            '-write_id3v1', '1'          
         ];
 
         // 4. Input files and mapping
         if (hasImage) {
-            command.input(imgPath);      // Input 1: The Image
-            command.input(metaPath);     // Input 2: The Metadata Text File
+            command.input(imgPath);      
+            command.input(metaPath);     
             
             outputOptions.push(
-                '-map', '0:a:0',         // Pull audio from Input 0
-                '-map', '1:v:0',         // Pull image from Input 1
-                '-map_metadata', '2',    // Pull ALL metadata cleanly from Input 2 (the text file)
-                '-c:v', 'mjpeg',         // Convert image to standard jpeg
-                '-disposition:v', 'attached_pic' // Tag image as official Cover Art
+                '-map', '0:a:0',         
+                '-map', '1:v:0',         
+                '-map_metadata', '2',    
+                '-c:v', 'mjpeg',         
+                '-disposition:v', 'attached_pic' 
             );
         } else {
-            command.input(metaPath);     // Input 1: The Metadata Text File
+            command.input(metaPath);     
             
             outputOptions.push(
-                '-map', '0:a:0',         // Pull audio from Input 0
-                '-map_metadata', '1'     // Pull ALL metadata cleanly from Input 1 (the text file)
+                '-map', '0:a:0',         
+                '-map_metadata', '1'     
             );
         }
 
@@ -104,7 +112,6 @@ module.exports = async (req, res) => {
         // 5. Save to disk first, THEN send to user
         command.save(outPath)
             .on('end', () => {
-                // Prevent browser/Vercel caching so you don't download the broken old file!
                 res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
                 res.setHeader('Pragma', 'no-cache');
                 res.setHeader('Expires', '0');
