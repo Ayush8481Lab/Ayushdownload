@@ -1,7 +1,9 @@
 {
-  "functions": {
-    "api/**/*.js": {
-      "maxDuration": 60
+  "redirects": [
+    {
+      "source": "/api/download",
+      "destination": "/download",
+      "permanent": true
     }
-  }
+  ]
 }
