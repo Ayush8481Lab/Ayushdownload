@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Clean inputs, stripping any accidental quotes that might break FFmpeg's ID3 parsing
+        // Clean quotes from variables so they don't interfere with our fluent-ffmpeg workaround
         const songTitle = String(title || tittle || 'Unknown Title').replace(/["']/g, "").trim();
         const songArtist = String(artist || 'Unknown Artist').replace(/["']/g, "").trim();
         const songAlbum = String(album || 'Unknown Album').replace(/["']/g, "").trim();
@@ -56,14 +56,15 @@ module.exports = async (req, res) => {
         let command = ffmpeg(url).audioBitrate('128k');
 
         // 2. Setup FFmpeg Metadata Options 
-        // FIXED: Removed all manual double quotes. Node.js natively handles spaces. 
-        // Also added '-map_metadata -1' to strip the original M3U8 tags so they don't overwrite ours.
         let outputOptions = [
+            // CRITICAL FIX 1: Wipes the invisible blank tags from the M3U8 stream so Artist shows up
             '-map_metadata', '-1', 
-            '-metadata', `title=${songTitle}`,
-            '-metadata', `artist=${songArtist}`,
-            '-metadata', `album_artist=${songArtist}`,
-            '-metadata', `album=${songAlbum}`
+            
+            // CRITICAL FIX 2: Variables are wrapped in `" "` to stop the fluent-ffmpeg space crash
+            '-metadata', `"title=${songTitle}"`,
+            '-metadata', `"artist=${songArtist}"`,
+            '-metadata', `"album_artist=${songArtist}"`,
+            '-metadata', `"album=${songAlbum}"`
         ];
 
         // 3. Attach Local Image IF downloaded successfully
@@ -73,13 +74,13 @@ module.exports = async (req, res) => {
                 '-map', '0:a',          
                 '-map', '1:v',          
                 '-c:v', 'mjpeg',        
-                '-id3v2_version', '3',   // Crucial for mobile phone metadata support
-                '-metadata:s:v', 'title=Album Cover', 
-                '-metadata:s:v', 'comment=Cover Front',
+                '-id3v2_version', '3',   // Forces metadata to ID3v2.3 (Required for mobile phones)
+                '-metadata:s:v', '"title=Album_Cover"',  // Wrapped in quotes AND underscored just to be 1000% safe
+                '-metadata:s:v', '"comment=Cover_Front"',
                 '-disposition:v', 'attached_pic' 
             );
         } else {
-            // Still enforce correct ID3 version even if there's no image
+            // Still enforce ID3v2.3 even if there's no image
             outputOptions.push('-id3v2_version', '3');
         }
 
