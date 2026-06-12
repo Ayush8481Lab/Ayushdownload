@@ -86,7 +86,7 @@ module.exports = async (req, res) => {
             );
         }
 
-        // Wait for BOTH tasks concurrently (Cuts idle waiting time in half)
+        // Wait for BOTH tasks concurrently
         await Promise.all(fetchTasks);
 
         // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION ---
@@ -106,24 +106,50 @@ module.exports = async (req, res) => {
             };
         }
 
+        // LYRICS FIX FOR MI MUSIC PLAYER AND OEM APPS
         if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
-            const rawText = lyricsData.lines.map(l => l.words).join('\n');
-            
-            if (lyricsData.syncType === "LINE_SYNCED") {
+            let lrcText = "";
+            let plainText = "";
+            const syncLyrics = [];
+
+            lyricsData.lines.forEach(l => {
+                plainText += l.words + '\n';
+                if (l.timeTag) {
+                    // Recreate LRC format strictly eg: [01:25.97]Lyrics text here
+                    lrcText += `[${l.timeTag}]${l.words}\n`;
+                    syncLyrics.push({
+                        text: l.words,
+                        timeStamp: convertTimeTagToMs(l.timeTag)
+                    });
+                }
+            });
+
+            if (lyricsData.syncType === "LINE_SYNCED" && syncLyrics.length > 0) {
+                // 1. Mi Music looks for the .LRC parsed string directly inside the USLT tag
+                id3Tags.unsynchronisedLyrics = {
+                    language: 'eng',
+                    text: lrcText.trim()
+                };
+
+                // 2. Standard SYLT (For players that natively support the binary synced tag)
                 id3Tags.synchronisedLyrics = [{
                     language: 'eng',
                     timeStampFormat: 2,
                     contentType: 1,
-                    synchronisedText: lyricsData.lines.map(l => ({
-                        text: l.words,
-                        timeStamp: convertTimeTagToMs(l.timeTag)
-                    }))
+                    synchronisedText: syncLyrics
                 }];
+
+                // 3. Fallback for players that strictly read custom TXXX:LYRICS
+                id3Tags.userDefinedText = [{
+                    description: 'LYRICS',
+                    value: lrcText.trim()
+                }];
+            } else {
+                id3Tags.unsynchronisedLyrics = {
+                    language: 'eng',
+                    text: plainText.trim()
+                };
             }
-            id3Tags.unsynchronisedLyrics = {
-                language: 'eng',
-                text: rawText
-            };
         }
 
         // Create the raw ID3v2 header buffer instantly (ZERO disk I/O)
@@ -136,24 +162,25 @@ module.exports = async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // Send the ID3 Tag Header immediately so the client starts downloading < 1 second!
+        // Prepend our properly formatted ID3 tag right at the front!
         res.write(id3HeaderBuffer);
 
-        // Run FFmpeg & Pipe purely Raw Audio data right behind the ID3 tag
+        // Run FFmpeg & Pipe purely Raw Audio data
         ffmpeg(url)
             .outputOptions([
-                '-vn',                   // Skip cover art in FFmpeg (We already injected it in the ID3 Header!)
+                '-vn',                   // Skip cover art in FFmpeg (We handled it above)
                 '-f', 'mp3',             // Force raw MP3 stream out
                 '-c:a', 'libmp3lame',    // MP3 encoder
                 '-b:a', targetBitrate,   // Quality enforcement
-                '-map_metadata', '-1',   // Strip original M3U8 metadata so it doesn't conflict with our ID3 header
+                '-map_metadata', '-1',   // Strip original metadata
+                '-write_id3v2', '0',     // 🚫 CRITICAL FIX: Prevent FFmpeg from generating a duplicate ID3v2 tag!
+                '-id3v2_version', '0',   // 🚫 Ensures no empty metadata header hides your injected ID3
                 '-threads', '0'          // Use all available CPU cores for decoding
             ])
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
                 if (!res.writableEnded) res.end();
             })
-            // Pipes the audio chunks continuously, automatically closing the connection when done.
             .pipe(res, { end: true });
 
     } catch (err) {
