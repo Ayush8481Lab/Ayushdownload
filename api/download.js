@@ -1,7 +1,7 @@
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
-const crypto = require('crypto');
+const NodeID3 = require('node-id3');
 
 // VERCEL HACK: Copy FFmpeg to /tmp and give it execute permissions
 const tmpFfmpegPath = '/tmp/ffmpeg';
@@ -16,6 +16,18 @@ try {
     console.error("Failed to setup FFmpeg in /tmp:", error);
 }
 
+// Helper: Converts time string "01:25.97" into milliseconds (85970) for ID3 Sync
+const convertTimeTagToMs = (timeTag) => {
+    if (!timeTag) return 0;
+    const parts = timeTag.split(':');
+    if (parts.length >= 2) {
+        const minutes = parseInt(parts[0], 10);
+        const seconds = parseFloat(parts[1]);
+        return Math.floor((minutes * 60 + seconds) * 1000);
+    }
+    return 0;
+};
+
 module.exports = async (req, res) => {
     try {
         let { url, format, imageUrl, title, tittle, artist, album, trackid } = req.query;
@@ -29,27 +41,41 @@ module.exports = async (req, res) => {
         const songArtist = cleanStr(artist || 'Unknown Artist');
         const songAlbum = cleanStr(album || 'Unknown Album');
         
+        const outputFormat = 'mp3'; // Force MP3 (ID3 tags only apply to MP3s)
+        const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
+
+        // DYNAMIC QUALITY EXTRACTOR
         let targetBitrate = '320k'; 
         const qualityMatch = url.match(/\/(\d+)\.mp4/);
         if (qualityMatch && qualityMatch[1]) {
             targetBitrate = `${qualityMatch[1]}k`; 
         }
 
-        // --- FETCH IMAGE & LYRICS CONCURRENTLY ---
+        // --- OPTIMIZATION 1: PARALLEL NETWORK REQUESTS ---
         const fetchTasks = [];
         let imageBuffer = null;
+        let imageMime = 'image/jpeg';
         let lyricsData = null;
 
+        // Task A: Fetch Image
         if (imageUrl) {
             if (!imageUrl.startsWith('http')) imageUrl = 'https://' + imageUrl;
             fetchTasks.push(
                 fetch(imageUrl, { headers: { "User-Agent": "Mozilla/5.0" } })
                     .then(async imgRes => {
-                        if (imgRes.ok) imageBuffer = Buffer.from(await imgRes.arrayBuffer());
+                        if (imgRes.ok) {
+                            const contentType = imgRes.headers.get('content-type') || '';
+                            if (contentType.includes('webp')) imageMime = 'image/webp';
+                            else if (contentType.includes('png')) imageMime = 'image/png';
+                            
+                            const arrayBuf = await imgRes.arrayBuffer();
+                            imageBuffer = Buffer.from(arrayBuf);
+                        }
                     }).catch(e => console.error("Image fetch failed", e))
             );
         }
 
+        // Task B: Fetch Lyrics
         if (trackid) {
             const lyricsUrl = `https://lyr-nine.vercel.app/api/lyrics?url=https://open.spotify.com/track/${trackid}&format=lrc`;
             fetchTasks.push(
@@ -62,113 +88,108 @@ module.exports = async (req, res) => {
 
         await Promise.all(fetchTasks);
 
-        // --- GENERATE FFMETADATA FILE IN MEMORY ---
-        // This completely fixes the string-crashing bugs and properly injects Mi Music Lyrics natively
-        let ffmetadata = `;FFMETADATA1\n`;
-        
-        // Native FFmpeg escaping to prevent multiline crashes
-        const escapeMeta = (str) => String(str)
-            .replace(/\\/g, '\\\\')
-            .replace(/=/g, '\\=')
-            .replace(/;/g, '\\;')
-            .replace(/#/g, '\\#')
-            .replace(/\n/g, '\\n'); // Uses FFmpeg's native newline decoder
+        // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION ---
+        const id3Tags = {
+            title: songTitle,
+            artist: songArtist,
+            album: songAlbum,
+            performerInfo: songArtist
+        };
 
-        ffmetadata += `title=${escapeMeta(songTitle)}\n`;
-        ffmetadata += `artist=${escapeMeta(songArtist)}\n`;
-        ffmetadata += `album=${escapeMeta(songAlbum)}\n`;
+        if (imageBuffer) {
+            id3Tags.image = {
+                mime: imageMime,
+                type: { id: 3, name: 'front cover' },
+                description: 'Cover Art',
+                imageBuffer: imageBuffer
+            };
+        }
 
-        if (lyricsData && Array.isArray(lyricsData.lines) && lyricsData.lines.length > 0) {
+        // ==========================================
+        // 🔥 THE MI MUSIC PERFECT LYRICS FIX 🔥
+        // ==========================================
+        if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
+            
+            // 1. Build the STRICT standard LRC formatted block that Mi Music looks for
+            const lrcLines = [];
+            lrcLines.push(`[ti:${songTitle}]`);
+            lrcLines.push(`[ar:${songArtist}]`);
+            lrcLines.push(`[al:${songAlbum}]`);
+            
+            lyricsData.lines.forEach(l => {
+                const time = l.timeTag ? `[${l.timeTag}]` : '[00:00.00]';
+                const words = l.words ? l.words : '♪'; // Add note if gap exists so parser doesn't crash
+                lrcLines.push(`${time}${words}`);
+            });
+
+            const lrcText = lrcLines.join('\n');
+            const rawText = lyricsData.lines.map(l => l.words).join('\n');
+            
             if (lyricsData.syncType === "LINE_SYNCED") {
-                // Strict Android MediaStore LRC format
-                let lrcText = `[ti:${songTitle}]\n[ar:${songArtist}]\n[al:${songAlbum}]\n`;
-                lrcText += lyricsData.lines.map(l => `[${l.timeTag || '00:00.00'}]${(l.words || '♪').trim()}`).join('\n');
                 
-                // Tag A: Standard USLT frame
-                ffmetadata += `lyrics=${escapeMeta(lrcText)}\n`;
-                // Tag B: Custom TXXX Lyrics frame (Specifically for Xiaomi/KuGou Music)
-                ffmetadata += `LYRICS=${escapeMeta(lrcText)}\n`; 
+                // High-End Players (Spotify, Apple Music offline)
+                id3Tags.synchronisedLyrics = [{
+                    language: 'XXX', // 'XXX' prevents Asian OEM players from rejecting foreign lyrics
+                    timeStampFormat: 2,
+                    contentType: 1,
+                    synchronisedText: lyricsData.lines.map(l => ({
+                        text: l.words || '♪',
+                        timeStamp: convertTimeTagToMs(l.timeTag)
+                    }))
+                }];
+                
+                // Mi Music / Samsung Music Fallback Fix (They scan this frame specifically!)
+                id3Tags.unsynchronisedLyrics = {
+                    language: 'XXX',
+                    shortText: '', // Keep empty
+                    text: lrcText  // Contains exact "[00:31.06]Line 1" strings
+                };
+                
             } else {
-                // Unsynced fallback
-                const plainText = lyricsData.lines.map(l => (l.words || '').trim()).join('\n');
-                ffmetadata += `lyrics=${escapeMeta(plainText)}\n`;
+                // If API returns no timestamps, pass just words
+                id3Tags.unsynchronisedLyrics = {
+                    language: 'XXX',
+                    shortText: '',
+                    text: rawText
+                };
             }
         }
 
-        // Save metadata & cover dynamically to Vercel's fast /tmp storage
-        const metaId = crypto.randomBytes(6).toString('hex');
-        const metaPath = `/tmp/meta_${metaId}.txt`;
-        const coverPath = `/tmp/cover_${metaId}.jpg`;
-        
-        fs.writeFileSync(metaPath, ffmetadata);
+        // Create the raw ID3v2 header buffer instantly (ZERO disk I/O)
+        const id3HeaderBuffer = NodeID3.create(id3Tags);
 
-        let hasCover = false;
-        if (imageBuffer) {
-            fs.writeFileSync(coverPath, imageBuffer);
-            hasCover = true;
-        }
-
-        // Auto-delete /tmp files when stream completes
-        const cleanup = () => {
-            try { if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath); } catch(e) {}
-            try { if (hasCover && fs.existsSync(coverPath)) fs.unlinkSync(coverPath); } catch(e) {}
-        };
-
-        const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio";
-
-        // --- INSTANT STREAMING ---
-        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.mp3"`);
+        // --- OPTIMIZATION 3: INSTANT STREAMING (YOUR ORIGINAL STABLE PIPELINE) ---
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        res.on('finish', cleanup);
-        res.on('close', cleanup);
+        // Send the complete ID3 Tag Header immediately to prevent Vercel Timeout!
+        res.write(id3HeaderBuffer);
 
-        // --- FFMPEG PIPELINE ---
-        const command = ffmpeg();
-        
-        command.input(url);         // Input 0: M3U8 Stream
-        command.input(metaPath);    // Input 1: Flawless Metadata Tag File
-        
-        const outputOptions = [
-            '-f', 'mp3',
-            '-c:a', 'libmp3lame',
-            '-b:a', targetBitrate,
-            '-map', '0:a',               // Process Audio Stream
-            '-map_metadata', '1',        // Map all lyrics & text from Input 1
-            '-id3v2_version', '3',       // ID3v2.3 is the ONLY format 100% supported by Mi Music [VITAL]
-            '-threads', '0'
-        ];
-
-        if (hasCover) {
-            command.input(coverPath);    // Input 2: Album Art
-            outputOptions.push(
-                '-map', '2:v',
-                '-c:v', 'mjpeg',
-                '-disposition:v', 'attached_pic',
-                '-metadata:s:v', 'title=Album cover',
-                '-metadata:s:v', 'comment=Cover (front)'
-            );
-        } else {
-            outputOptions.push('-vn');
-        }
-
-        command
-            .outputOptions(outputOptions)
+        // Run FFmpeg & Pipe purely Raw Audio data exactly like your first working version
+        ffmpeg(url)
+            .outputOptions([
+                '-vn',                   // Skip cover art in FFmpeg (We already injected it in the ID3 Header)
+                '-f', 'mp3',             // Force raw MP3 stream out
+                '-c:a', 'libmp3lame',    // MP3 encoder
+                '-b:a', targetBitrate,   // Quality enforcement
+                '-map_metadata', '-1',   // Strip original M3U8 metadata so it doesn't conflict
+                '-threads', '0'          // Use all available CPU cores for decoding
+            ])
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
-                cleanup();
                 if (!res.writableEnded) res.end();
             })
-            // Pipes dynamically to user—no Vercel timeout crashes ever again
+            // Pipes the audio chunks continuously, automatically closing the connection when done.
             .pipe(res, { end: true });
 
     } catch (err) {
-        console.error('API Error:', err);
         if (!res.headersSent) {
             res.status(500).json({ error: "API Crashed", details: err.message });
         } else {
-            res.end();
+            res.end(); // Fail gracefully if stream already started
         }
     }
 };
