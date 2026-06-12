@@ -2,7 +2,6 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
 const crypto = require('crypto');
-const NodeID3 = require('node-id3');
 
 // VERCEL HACK: Copy FFmpeg safely
 const tmpFfmpegPath = '/tmp/ffmpeg';
@@ -17,19 +16,21 @@ try {
     ffmpeg.setFfmpegPath(ffmpegPath);
 }
 
-// Helper: Converts time string "01:25.97" into milliseconds for ID3 Sync
-const convertTimeTagToMs = (timeTag) => {
-    if (!timeTag) return 0;
-    const parts = timeTag.split(':');
-    if (parts.length >= 2) {
-        const minutes = parseInt(parts[0], 10);
-        const seconds = parseFloat(parts[1]);
-        return Math.floor((minutes * 60 + seconds) * 1000);
-    }
-    return 0;
-};
-
 module.exports = async (req, res) => {
+    let command;
+    let hasCover = false;
+    const coverId = crypto.randomBytes(4).toString('hex');
+    const coverPath = `/tmp/cover_${coverId}.jpg`;
+
+    const cleanup = () => {
+        if (hasCover && fs.existsSync(coverPath)) {
+            try { fs.unlinkSync(coverPath); } catch (e) {}
+        }
+        if (command) {
+            try { command.kill('SIGKILL'); } catch (e) {}
+        }
+    };
+
     try {
         let { url, format, imageUrl, title, tittle, artist, album, trackid } = req.query;
 
@@ -43,8 +44,10 @@ module.exports = async (req, res) => {
         const songAlbum = cleanStr(album || 'Unknown Album');
         
         const outputFormat = 'mp3'; 
-        // Generates a random string suffix to bypass Mi Music's aggressive file caching!
-        const safeFileName = `${songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_")}_${crypto.randomBytes(2).toString('hex')}`;
+
+        // CRITICAL FIX: Appending Date.now() bypasses Android's aggressive "No Lyrics" database cache!
+        const baseName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio";
+        const safeFileName = `${baseName}_${Date.now()}`;
 
         let targetBitrate = '320k'; 
         const qualityMatch = url.match(/\/(\d+)\.mp4/);
@@ -55,7 +58,6 @@ module.exports = async (req, res) => {
         // --- PARALLEL NETWORK REQUESTS (WITH TIMEOUTS) ---
         const fetchTasks = [];
         let imageBuffer = null;
-        let imageMime = 'image/jpeg';
         let lyricsData = null;
 
         if (imageUrl) {
@@ -63,13 +65,7 @@ module.exports = async (req, res) => {
             fetchTasks.push(
                 fetch(imageUrl, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(4000) })
                     .then(async imgRes => {
-                        if (imgRes.ok) {
-                            const contentType = imgRes.headers.get('content-type') || '';
-                            if (contentType.includes('webp')) imageMime = 'image/webp';
-                            else if (contentType.includes('png')) imageMime = 'image/png';
-                            
-                            imageBuffer = Buffer.from(await imgRes.arrayBuffer());
-                        }
+                        if (imgRes.ok) imageBuffer = Buffer.from(await imgRes.arrayBuffer());
                     }).catch(e => console.error("Image fetch failed"))
             );
         }
@@ -86,26 +82,10 @@ module.exports = async (req, res) => {
 
         await Promise.allSettled(fetchTasks);
 
-        // --- BUILD STRICT LRC FORMAT & IN-MEMORY ID3 ---
-        const id3Tags = {
-            title: songTitle,
-            artist: songArtist,
-            album: songAlbum,
-            performerInfo: songArtist 
-        };
-
-        if (imageBuffer) {
-            id3Tags.image = {
-                mime: imageMime,
-                type: { id: 3, name: 'front cover' },
-                description: 'Cover Art',
-                imageBuffer: imageBuffer
-            };
-        }
-
+        // --- 1. BUILD STRICT LRC TEXT ---
+        let lrcTextVal = '';
         if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
-            // 1. BUILD STRICT LRC FORMAT (No spaces after colons, No unknown tags!)
-            let lrcTextVal = `[ar:${songArtist}]\n`;
+            lrcTextVal += `[ar:${songArtist}]\n`;
             lrcTextVal += `[al:${songAlbum}]\n`;
             lrcTextVal += `[ti:${songTitle}]\n`;
             lrcTextVal += `[au:${songArtist}]\n`;
@@ -115,53 +95,30 @@ module.exports = async (req, res) => {
                 const timeMatch = lastLine.timeTag.match(/(\d{2}:\d{2})/);
                 if (timeMatch) lrcTextVal += `[length:${timeMatch[1]}]\n`;
             }
-            lrcTextVal += `\n`; // Empty line before lyrics start
+            lrcTextVal += `\n`;
             
             lrcTextVal += lyricsData.lines.map(l => {
                 const time = l.timeTag ? `[${l.timeTag}]` : '[00:00.00]';
                 const words = l.words ? l.words.trim() : ''; 
-                return `${time}${words || ' '}`; // Blank space prevents crash on empty lyrical lines
+                return `${time}${words || ' '}`; // Blank space stops parsers from dying on empty instrumental lines
             }).join('\n');
-
-            // 2. PRIMARY LYRICS INJECTION (Mi Music / Standard Android)
-            id3Tags.unsynchronisedLyrics = {
-                language: 'XXX',     // "XXX" = All Languages. Forces Android to read it regardless of system language.
-                shortText: '',       // Mi Music requires this to be strictly empty
-                text: lrcTextVal
-            };
-
-            // 3. SECONDARY LYRICS INJECTION (Vivo Music / Oppo Music Fallback)
-            id3Tags.userDefinedText = [{
-                description: 'LYRICS',
-                value: lrcTextVal
-            }];
-
-            // 4. TERTIARY BINARY SYNC 
-            if (lyricsData.syncType === "LINE_SYNCED") {
-                id3Tags.synchronisedLyrics = [{
-                    language: 'eng',
-                    timeStampFormat: 2,
-                    contentType: 1,
-                    synchronisedText: lyricsData.lines.map(l => ({
-                        text: l.words || ' ',
-                        timeStamp: convertTimeTagToMs(l.timeTag)
-                    }))
-                }];
-            }
         }
 
-        const id3HeaderBuffer = NodeID3.create(id3Tags);
+        if (imageBuffer) {
+            fs.writeFileSync(coverPath, imageBuffer);
+            hasCover = true;
+        }
 
         // --- INSTANT STREAMING ---
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // Send the ID3 Tag Header immediately!
-        res.write(id3HeaderBuffer);
+        res.on('finish', cleanup);
+        res.on('close', cleanup);
 
-        // --- FFMPEG PIPELINE ---
-        ffmpeg(url)
+        // --- 2. PURE FFMPEG METADATA PIPELINE ---
+        command = ffmpeg(url)
             .inputOptions([
                 '-allowed_extensions', 'ALL',
                 '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
@@ -169,25 +126,57 @@ module.exports = async (req, res) => {
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
                 '-reconnect_delay_max', '5'
-            ])
-            .outputOptions([
-                '-vn',                   
-                '-f', 'mp3',             
-                '-c:a', 'libmp3lame',    
-                '-b:a', targetBitrate,   
-                '-map_metadata', '-1',     // Strip M3U8 metadata
-                '-write_id3v2', '0',       // CRITICAL: Stop FFmpeg from generating a blank ID3 tag that overwrites NodeID3
-                '-write_id3v1', '0',       // Stop legacy tags
-                '-threads', '1'          
-            ])
+            ]);
+
+        const outputOptions = [
+            '-f', 'mp3',             
+            '-c:a', 'libmp3lame',    
+            '-b:a', targetBitrate,   
+            '-map_metadata', '-1',    // Strip raw M3U8 garbage tags
+            '-id3v2_version', '3',    // CRITICAL: ID3v2.3 is the ONLY version perfectly supported by Android 
+            '-metadata', `title=${songTitle}`,
+            '-metadata', `artist=${songArtist}`,
+            '-metadata', `album=${songAlbum}`,
+            '-metadata', `album_artist=${songArtist}` // Album Artist is often required by Vivo Music
+        ];
+
+        // MUX IN THE COVER ART NATIVELY
+        if (hasCover) {
+            command.input(coverPath);
+            outputOptions.push(
+                '-map', '0:a:0',
+                '-map', '1:v:0',
+                '-c:v', 'mjpeg',
+                '-disposition:v', 'attached_pic',
+                '-metadata:s:v', 'title=Album cover',
+                '-metadata:s:v', 'comment=Cover (front)'
+            );
+        } else {
+            outputOptions.push('-map', '0:a:0', '-vn');
+        }
+
+        // MUX IN THE LYRICS NATIVELY
+        if (lrcTextVal) {
+            // Standard USLT mapping (Works in Mi Music, Samsung, standard players)
+            outputOptions.push('-metadata', `lyrics=${lrcTextVal}`);
+            // Secret fallback for Vivo/Oppo Music quirks
+            outputOptions.push('-metadata', `TXXX:LYRICS=${lrcTextVal}`);
+        }
+
+        outputOptions.push('-threads', '1');
+
+        command
+            .outputOptions(outputOptions)
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
+                cleanup();
                 if (!res.writableEnded) res.end();
             })
             .pipe(res, { end: true });
 
     } catch (err) {
         console.error("API Crash:", err);
+        cleanup();
         if (!res.headersSent) {
             res.status(500).json({ error: "API Crashed", details: err.message });
         } else {
