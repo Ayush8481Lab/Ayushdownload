@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Clean quotes from dynamic metadata to prevent any FFmpeg string escaping bugs
+        // Clean inputs, stripping any accidental quotes that might break FFmpeg's ID3 parsing
         const songTitle = String(title || tittle || 'Unknown Title').replace(/["']/g, "").trim();
         const songArtist = String(artist || 'Unknown Artist').replace(/["']/g, "").trim();
         const songAlbum = String(album || 'Unknown Album').replace(/["']/g, "").trim();
@@ -56,12 +56,14 @@ module.exports = async (req, res) => {
         let command = ffmpeg(url).audioBitrate('128k');
 
         // 2. Setup FFmpeg Metadata Options 
-        // We wrap the dynamic strings entirely in double quotes to bypass fluent-ffmpeg's bug
+        // FIXED: Removed all manual double quotes. Node.js natively handles spaces. 
+        // Also added '-map_metadata -1' to strip the original M3U8 tags so they don't overwrite ours.
         let outputOptions = [
-            '-metadata', `"title=${songTitle}"`,
-            '-metadata', `"artist=${songArtist}"`,
-            '-metadata', `"album_artist=${songArtist}"`,
-            '-metadata', `"album=${songAlbum}"`
+            '-map_metadata', '-1', 
+            '-metadata', `title=${songTitle}`,
+            '-metadata', `artist=${songArtist}`,
+            '-metadata', `album_artist=${songArtist}`,
+            '-metadata', `album=${songAlbum}`
         ];
 
         // 3. Attach Local Image IF downloaded successfully
@@ -71,13 +73,14 @@ module.exports = async (req, res) => {
                 '-map', '0:a',          
                 '-map', '1:v',          
                 '-c:v', 'mjpeg',        
-                '-id3v2_version', '3',  
-                // FIXED: Removed spaces completely (Album_Cover). 
-                // This guarantees the 'Error opening output file cover"' bug cannot happen again.
-                '-metadata:s:v', 'title=Album_Cover', 
-                '-metadata:s:v', 'comment=Cover_Front',
+                '-id3v2_version', '3',   // Crucial for mobile phone metadata support
+                '-metadata:s:v', 'title=Album Cover', 
+                '-metadata:s:v', 'comment=Cover Front',
                 '-disposition:v', 'attached_pic' 
             );
+        } else {
+            // Still enforce correct ID3 version even if there's no image
+            outputOptions.push('-id3v2_version', '3');
         }
 
         command.outputOptions(outputOptions);
