@@ -1,86 +1,85 @@
 const ffmpeg = require('fluent-ffmpeg');
-const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const fs = require('fs');
 
-// Safely tell fluent-ffmpeg where the Vercel-compatible binary is
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+// VERCEL HACK: Copy FFmpeg to /tmp and give it execute permissions
+const tmpFfmpegPath = '/tmp/ffmpeg';
+
+try {
+    if (!fs.existsSync(tmpFfmpegPath)) {
+        fs.copyFileSync(ffmpegPath, tmpFfmpegPath);
+        fs.chmodSync(tmpFfmpegPath, 0o755); // 0755 grants execution rights
+    }
+    ffmpeg.setFfmpegPath(tmpFfmpegPath);
+} catch (error) {
+    console.error("Failed to setup FFmpeg in /tmp:", error);
+}
 
 module.exports = (req, res) => {
     try {
-        // 1. Grab parameters safely (force them to be strings to prevent TypeErrors)
-        let url = req.query.url ? String(req.query.url) : '';
-        let format = req.query.format ? String(req.query.format) : 'mp3';
-        let imageUrl = req.query.imageUrl ? String(req.query.imageUrl) : '';
-        
-        let title = req.query.title || req.query.tittle || 'Unknown Title';
-        let artist = req.query.artist || 'Unknown Artist';
-        let album = req.query.album || 'Unknown Album';
-
-        // Force text to be strings
-        title = String(title);
-        artist = String(artist);
-        album = String(album);
+        // 1. Grab parameters safely
+        let { url, format, imageUrl, title, tittle, artist, album } = req.query;
 
         if (!url) {
-            return res.status(400).json({ error: "Please provide an M3U8 url parameter" });
+            return res.status(400).json({ error: "Missing M3U8 url parameter" });
         }
 
-        // Fix M3U8 URL if it misses https
+        // Ensure URL has https://
         if (!url.startsWith('http')) {
             url = 'https://' + url;
         }
 
-        // Create a safe file name without special characters to prevent download errors
-        const safeFileName = title.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio";
+        // 2. Set Fallback Metadata
+        const songTitle = String(title || tittle || 'Unknown Title');
+        const songArtist = String(artist || 'Unknown Artist');
+        const songAlbum = String(album || 'Unknown Album');
+        const outputFormat = String(format || 'mp3');
 
-        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${format}"`);
+        // Create a safe file name (removes special characters)
+        const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
+
+        // Set headers to trigger file download on mobile
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // 2. Setup FFmpeg Command
-        let command = ffmpeg(url).format(format).audioBitrate('128k');
-        
-        // Setup Text Metadata
+        // 3. Setup FFmpeg Command using your working base
+        let command = ffmpeg(url).format(outputFormat).audioBitrate('128k');
+
+        // Add Text Metadata (Title, Artist, Album)
         let outputOptions = [
-            '-metadata', `title=${title}`,
-            '-metadata', `artist=${artist}`,
-            '-metadata', `album=${album}`
+            '-metadata', `title=${songTitle}`,
+            '-metadata', `artist=${songArtist}`,
+            '-metadata', `album=${songAlbum}`
         ];
 
-        // 3. SAFE Image Handling (Only process if it's a real HTTP link)
+        // 4. Add Image Cover Art IF a valid link is provided
         if (imageUrl && imageUrl.startsWith('http')) {
             command.input(imageUrl);
             outputOptions.push(
                 '-map', '0:a',          // Map Audio
-                '-map', '1:v',          // Map Video/Image
-                '-c:v', 'mjpeg',        // Compress image to standard JPEG
-                '-id3v2_version', '3',  // Use ID3v2.3 (Highest mobile compatibility)
-                '-disposition:v', 'attached_pic' // Tag as Cover Art
+                '-map', '1:v',          // Map Image
+                '-c:v', 'mjpeg',        // Convert image to jpeg
+                '-id3v2_version', '3',  // Use mobile-friendly ID3 tags
+                '-disposition:v', 'attached_pic' // Set as Cover Art!
             );
-        } else if (imageUrl) {
-            console.log("Ignored invalid image URL:", imageUrl);
         }
 
+        // Apply options
         command.outputOptions(outputOptions);
 
-        // 4. Safe Error Handling
+        // 5. Run FFmpeg and stream directly to the user
         command.on('error', (err) => {
-            console.error('FFmpeg processing error:', err.message);
-            // If headers are not sent, send a JSON error. Otherwise, end the stream safely.
+            console.error('FFmpeg Conversion Error:', err.message);
             if (!res.headersSent) {
-                res.status(500).json({ error: 'FFmpeg failed to process', details: err.message });
+                res.status(500).json({ error: "FFmpeg Failed", details: err.message });
             } else {
-                res.end();
+                res.end(); // Safely end stream if it fails halfway
             }
-        });
-
-        // 5. Pipe to Mobile Phone
-        command.pipe(res, { end: true });
+        }).pipe(res, { end: true });
 
     } catch (err) {
-        console.error('Server crash avoided:', err);
         if (!res.headersSent) {
-            res.status(500).json({ error: 'API Error', details: err.message });
-        } else {
-            res.end();
+            res.status(500).json({ error: "API Crashed", details: err.message });
         }
     }
 };
