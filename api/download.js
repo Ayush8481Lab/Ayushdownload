@@ -22,10 +22,10 @@ module.exports = async (req, res) => {
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Set Metadata & clean any raw double quotes that could break fluent-ffmpeg's regex workaround
-        const songTitle = String(title || tittle || 'Unknown Title').replace(/"/g, '');
-        const songArtist = String(artist || 'Unknown Artist').replace(/"/g, '');
-        const songAlbum = String(album || 'Unknown Album').replace(/"/g, '');
+        // Clean quotes from dynamic metadata to prevent any FFmpeg string escaping bugs
+        const songTitle = String(title || tittle || 'Unknown Title').replace(/["']/g, "").trim();
+        const songArtist = String(artist || 'Unknown Artist').replace(/["']/g, "").trim();
+        const songAlbum = String(album || 'Unknown Album').replace(/["']/g, "").trim();
         const outputFormat = String(format || 'mp3');
         const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
 
@@ -36,7 +36,7 @@ module.exports = async (req, res) => {
         
         let hasImage = false;
 
-        // 1. Download the Image manually by pretending to be Google Chrome
+        // 1. Download the Image manually
         if (imageUrl) {
             if (!imageUrl.startsWith('http')) imageUrl = 'https://' + imageUrl;
             try {
@@ -53,10 +53,10 @@ module.exports = async (req, res) => {
             }
         }
 
-        // 2. Setup FFmpeg Metadata Options
         let command = ffmpeg(url).audioBitrate('128k');
 
-        // FIXED: Wrap variables natively in double-quotes to bypass `fluent-ffmpeg` spacing bug
+        // 2. Setup FFmpeg Metadata Options 
+        // We wrap the dynamic strings entirely in double quotes to bypass fluent-ffmpeg's bug
         let outputOptions = [
             '-metadata', `"title=${songTitle}"`,
             '-metadata', `"artist=${songArtist}"`,
@@ -68,30 +68,30 @@ module.exports = async (req, res) => {
         if (hasImage) {
             command.input(imgPath);
             outputOptions.push(
-                '-map', '0:a',          // Map Audio
-                '-map', '1:v',          // Map Image
-                '-c:v', 'mjpeg',        // Convert image to jpeg
-                '-id3v2_version', '3',  // Crucial for mobile phones
-                '-metadata:s:v', '"title=Album cover"',   // FIXED: Wraps entire argument string in quotes
-                '-metadata:s:v', '"comment=Cover (front)"', // FIXED: Wraps entire argument string in quotes
-                '-disposition:v', 'attached_pic' // Tag as cover
+                '-map', '0:a',          
+                '-map', '1:v',          
+                '-c:v', 'mjpeg',        
+                '-id3v2_version', '3',  
+                // FIXED: Removed spaces completely (Album_Cover). 
+                // This guarantees the 'Error opening output file cover"' bug cannot happen again.
+                '-metadata:s:v', 'title=Album_Cover', 
+                '-metadata:s:v', 'comment=Cover_Front',
+                '-disposition:v', 'attached_pic' 
             );
         }
 
         command.outputOptions(outputOptions);
 
-        // 4. Save to disk first (Crucial for Cover Art to work), THEN send to user
+        // 4. Save to disk first, THEN send to user
         command.save(outPath)
             .on('end', () => {
-                // Set headers to trigger file download
                 res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
                 res.setHeader('Content-Type', 'audio/mpeg');
 
-                // Send the perfectly packaged file to the user
                 const readStream = fs.createReadStream(outPath);
                 readStream.pipe(res);
 
-                // Delete the temp files so Vercel doesn't run out of storage
+                // Delete the temp files 
                 readStream.on('end', () => {
                     if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
                     if (hasImage && fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
