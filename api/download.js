@@ -119,29 +119,26 @@ module.exports = async (req, res) => {
 
         const id3HeaderBuffer = NodeID3.create(id3Tags);
 
+        // SPEED FIX: Explicitly tell Vercel to use Chunked Transfer to prevent buffering
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
         res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Transfer-Encoding', 'chunked'); 
 
-        // Send ID3 tags instantly
+        // Send ID3 tags instantly to start the browser download immediately
         res.write(id3HeaderBuffer);
-        
-        // SPEED HACK: Force Node to push headers to the browser right now.
-        // This triggers the browser's "Save As" popup instantly without waiting for FFmpeg.
-        if (res.flushHeaders) res.flushHeaders(); 
 
         ffmpeg(url)
             .inputOptions([
-                // SPEED HACK 1: Stop FFmpeg from analyzing the whole stream before starting
-                '-probesize', '32768',       // Reduce probe size to the bare minimum (32KB)
-                '-analyzeduration', '0',     // Tell FFmpeg to start instantly (0 delay)
+                // BANDWIDTH MULTIPLIER: Reuse the same HTTP connection for all M3U8 chunks
+                // This eliminates the SSL handshake delay between every single audio segment!
+                '-http_persistent 1', 
                 
-                // Network stability flags
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '2'
+                '-reconnect 1',
+                '-reconnect_streamed 1',
+                '-reconnect_delay_max 2'
             ])
             .outputOptions([
                 '-vn',                   
@@ -149,21 +146,17 @@ module.exports = async (req, res) => {
                 '-c:a', 'libmp3lame',    
                 '-b:a', targetBitrate,   
                 
-                // SPEED HACK 2: Tell LAME encoder to use its absolute fastest algorithm
-                // (0 = fastest, 9 = slowest). It uses much less CPU, making downloads incredibly fast.
+                // SPEED OPTIMIZATION: LAME's fastest CPU algorithm. Uses almost zero CPU.
                 '-compression_level', '0', 
                 
                 '-map_metadata', '-1',   
-                '-threads', '0',         
-                
-                // SPEED HACK 3: Push output packets instantly instead of waiting for large chunks
-                '-flush_packets', '1'    
+                '-threads', '0'
             ])
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
                 if (!res.writableEnded) res.end();
             })
-            // Pipe output. The stream is sent to the user piece-by-piece at max speed
+            // Pipe output to the user at maximum available network speed
             .pipe(res, { end: true });
 
     } catch (err) {
