@@ -43,7 +43,8 @@ module.exports = async (req, res) => {
         const songAlbum = cleanStr(album || 'Unknown Album');
         
         const outputFormat = 'mp3'; 
-        const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
+        // Generates a random string suffix to bypass Mi Music's aggressive file caching!
+        const safeFileName = `${songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_")}_${crypto.randomBytes(2).toString('hex')}`;
 
         let targetBitrate = '320k'; 
         const qualityMatch = url.match(/\/(\d+)\.mp4/);
@@ -51,13 +52,12 @@ module.exports = async (req, res) => {
             targetBitrate = `${qualityMatch[1]}k`; 
         }
 
-        // --- OPTIMIZATION 1: PARALLEL NETWORK REQUESTS (WITH TIMEOUTS) ---
+        // --- PARALLEL NETWORK REQUESTS (WITH TIMEOUTS) ---
         const fetchTasks = [];
         let imageBuffer = null;
         let imageMime = 'image/jpeg';
         let lyricsData = null;
 
-        // Task A: Fetch Image (Max 4s timeout to avoid Vercel crash)
         if (imageUrl) {
             if (!imageUrl.startsWith('http')) imageUrl = 'https://' + imageUrl;
             fetchTasks.push(
@@ -74,7 +74,6 @@ module.exports = async (req, res) => {
             );
         }
 
-        // Task B: Fetch Lyrics (Max 4s timeout to avoid Vercel crash)
         if (trackid) {
             const lyricsUrl = `https://lyr-nine.vercel.app/api/lyrics?url=https://open.spotify.com/track/${trackid}&format=lrc`;
             fetchTasks.push(
@@ -87,7 +86,7 @@ module.exports = async (req, res) => {
 
         await Promise.allSettled(fetchTasks);
 
-        // --- OPTIMIZATION 2: BUILD STRICT LRC FORMAT & IN-MEMORY ID3 ---
+        // --- BUILD STRICT LRC FORMAT & IN-MEMORY ID3 ---
         const id3Tags = {
             title: songTitle,
             artist: songArtist,
@@ -105,35 +104,39 @@ module.exports = async (req, res) => {
         }
 
         if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
-            // 1. BUILD THE EXACT LRC METADATA STRING YOU REQUESTED
-            let lrcTextVal = `[id: ${trackid || crypto.randomBytes(4).toString('hex')}]\n`;
-            lrcTextVal += `[ar: ${songArtist}]\n`;
-            lrcTextVal += `[al: ${songAlbum}]\n`;
-            lrcTextVal += `[ti: ${songTitle}]\n`;
-            lrcTextVal += `[au: ${songArtist}]\n`;
+            // 1. BUILD STRICT LRC FORMAT (No spaces after colons, No unknown tags!)
+            let lrcTextVal = `[ar:${songArtist}]\n`;
+            lrcTextVal += `[al:${songAlbum}]\n`;
+            lrcTextVal += `[ti:${songTitle}]\n`;
+            lrcTextVal += `[au:${songArtist}]\n`;
 
-            // Calculate length from the very last lyric timestamp
             const lastLine = lyricsData.lines[lyricsData.lines.length - 1];
             if (lastLine && lastLine.timeTag) {
                 const timeMatch = lastLine.timeTag.match(/(\d{2}:\d{2})/);
-                if (timeMatch) lrcTextVal += `[length: ${timeMatch[1]}]\n`;
+                if (timeMatch) lrcTextVal += `[length:${timeMatch[1]}]\n`;
             }
             lrcTextVal += `\n`; // Empty line before lyrics start
             
-            // 2. APPEND THE [Time]line SYNC TAGS
             lrcTextVal += lyricsData.lines.map(l => {
                 const time = l.timeTag ? `[${l.timeTag}]` : '[00:00.00]';
-                const words = l.words || ' '; // Prevent empty line crash
-                return `${time}${words}`;
+                const words = l.words ? l.words.trim() : ''; 
+                return `${time}${words || ' '}`; // Blank space prevents crash on empty lyrical lines
             }).join('\n');
 
-            // 3. EMBED THE STRICT STRING INTO THE MP3
+            // 2. PRIMARY LYRICS INJECTION (Mi Music / Standard Android)
             id3Tags.unsynchronisedLyrics = {
-                language: 'eng',
+                language: 'XXX',     // "XXX" = All Languages. Forces Android to read it regardless of system language.
+                shortText: '',       // Mi Music requires this to be strictly empty
                 text: lrcTextVal
             };
 
-            // 4. ALSO EMBED NATIVE BINARY SYNC (Bonus player compatibility)
+            // 3. SECONDARY LYRICS INJECTION (Vivo Music / Oppo Music Fallback)
+            id3Tags.userDefinedText = [{
+                description: 'LYRICS',
+                value: lrcTextVal
+            }];
+
+            // 4. TERTIARY BINARY SYNC 
             if (lyricsData.syncType === "LINE_SYNCED") {
                 id3Tags.synchronisedLyrics = [{
                     language: 'eng',
@@ -147,10 +150,9 @@ module.exports = async (req, res) => {
             }
         }
 
-        // Create the raw ID3v2 header buffer instantly
         const id3HeaderBuffer = NodeID3.create(id3Tags);
 
-        // --- OPTIMIZATION 3: INSTANT STREAMING ---
+        // --- INSTANT STREAMING ---
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
@@ -158,9 +160,8 @@ module.exports = async (req, res) => {
         // Send the ID3 Tag Header immediately!
         res.write(id3HeaderBuffer);
 
-        // --- CRITICAL FIX: FFMPEG PIPELINE ---
+        // --- FFMPEG PIPELINE ---
         ffmpeg(url)
-            // THESE INPUT OPTIONS ARE REQUIRED TO STOP M3U8 DOWNLOADS FROM FAILING
             .inputOptions([
                 '-allowed_extensions', 'ALL',
                 '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
@@ -170,12 +171,14 @@ module.exports = async (req, res) => {
                 '-reconnect_delay_max', '5'
             ])
             .outputOptions([
-                '-vn',                   // Skip cover art in FFmpeg (We already injected it in ID3)
-                '-f', 'mp3',             // Force raw MP3 stream out
+                '-vn',                   
+                '-f', 'mp3',             
                 '-c:a', 'libmp3lame',    
                 '-b:a', targetBitrate,   
-                '-map_metadata', '-1',   // Strip original M3U8 metadata
-                '-threads', '1'          // 1 is much safer for Vercel Free-Tier memory limits
+                '-map_metadata', '-1',     // Strip M3U8 metadata
+                '-write_id3v2', '0',       // CRITICAL: Stop FFmpeg from generating a blank ID3 tag that overwrites NodeID3
+                '-write_id3v1', '0',       // Stop legacy tags
+                '-threads', '1'          
             ])
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
