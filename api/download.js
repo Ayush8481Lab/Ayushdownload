@@ -1,6 +1,7 @@
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
+const crypto = require('crypto');
 const NodeID3 = require('node-id3');
 
 // VERCEL HACK: Copy FFmpeg to /tmp and give it execute permissions
@@ -16,6 +17,18 @@ try {
     console.error("Failed to setup FFmpeg in /tmp:", error);
 }
 
+// Helper: Converts time string "01:25.97" into milliseconds for ID3 Sync
+const convertTimeTagToMs = (timeTag) => {
+    if (!timeTag) return 0;
+    const parts = timeTag.split(':');
+    if (parts.length >= 2) {
+        const minutes = parseInt(parts[0], 10);
+        const seconds = parseFloat(parts[1]);
+        return Math.floor((minutes * 60 + seconds) * 1000);
+    }
+    return 0;
+};
+
 module.exports = async (req, res) => {
     try {
         let { url, format, imageUrl, title, tittle, artist, album, trackid } = req.query;
@@ -29,7 +42,7 @@ module.exports = async (req, res) => {
         const songArtist = cleanStr(artist || 'Unknown Artist');
         const songAlbum = cleanStr(album || 'Unknown Album');
         
-        const outputFormat = 'mp3'; 
+        const outputFormat = 'mp3';
         const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
 
         // DYNAMIC QUALITY EXTRACTOR
@@ -74,7 +87,27 @@ module.exports = async (req, res) => {
 
         await Promise.all(fetchTasks);
 
-        // --- IN-MEMORY ID3 CONSTRUCTION ---
+        // --- THE PERFECT FILE PIPELINE ---
+        // Instead of streaming blindly, we generate a flawless file in /tmp first.
+        const fileId = crypto.randomBytes(6).toString('hex');
+        const tmpAudioPath = `/tmp/audio_${fileId}.mp3`;
+
+        // 1. Download and Encode the Audio 
+        await new Promise((resolve, reject) => {
+            ffmpeg(url)
+                .outputOptions([
+                    '-vn',                   // Skip video/image
+                    '-c:a', 'libmp3lame',    // Enforce pure MP3
+                    '-b:a', targetBitrate,   // Quality enforcement
+                    '-map_metadata', '-1',   // Erase garbage metadata
+                    '-threads', '0'          // Multi-thread for fast completion
+                ])
+                .save(tmpAudioPath)          // Save to fast local Vercel memory
+                .on('end', resolve)
+                .on('error', reject);
+        });
+
+        // 2. Build the ID3 tags
         const id3Tags = {
             title: songTitle,
             artist: songArtist,
@@ -91,62 +124,71 @@ module.exports = async (req, res) => {
             };
         }
 
-        // --- MI MUSIC LYRICS FIX (Done entirely in NodeJS, no FFmpeg crashing) ---
+        // 3. Inject Lyrics tailored PERFECTLY for Android/Mi Music
         if (lyricsData && Array.isArray(lyricsData.lines) && lyricsData.lines.length > 0) {
             
-            // Mi Music natively scans for standard LRC headers and `\r\n` line endings
-            let lrcText = `[ti:${songTitle}]\r\n[ar:${songArtist}]\r\n[al:${songAlbum}]\r\n`;
-            
-            // Map the exact timestamps
+            // Build strictly formatted LRC string
+            let lrcText = `[ti:${songTitle}]\n[ar:${songArtist}]\n[al:${songAlbum}]\n`;
             lrcText += lyricsData.lines.map(l => {
                 const time = l.timeTag || '00:00.00';
-                const text = l.words || '♪'; // Fills instrumental gaps so the parser doesn't break
-                return `[${time}]${text}`;
-            }).join('\r\n');
+                const words = (l.words || '').trim(); // Remove empty noise
+                return `[${time}]${words}`;
+            }).join('\n');
 
-            // 1. Inject into standard USLT (Unsynchronised Lyrics)
+            // Tag A: Unsynchronised Lyrics (Primary Mi Music Scanner)
             id3Tags.unsynchronisedLyrics = {
-                language: 'eng',
+                language: 'XXX',    // 'XXX' forces Chinese players to accept it regardless of phone language
+                shortText: '',      // Crucial: leave description empty
                 text: lrcText
             };
 
-            // 2. Inject into TXXX (User Defined Text) frame for specific Chinese Android Players
+            // Tag B: TXXX Fallback (For strictly mapped OEM Parsers)
             id3Tags.userDefinedText = [{
                 description: 'LYRICS',
                 value: lrcText
             }];
+
+            // Tag C: Official SYLT Frame (For modern global players)
+            if (lyricsData.syncType === "LINE_SYNCED") {
+                id3Tags.synchronisedLyrics = [{
+                    language: 'XXX',
+                    timeStampFormat: 2,
+                    contentType: 1,
+                    shortText: '',
+                    synchronisedText: lyricsData.lines.map(l => ({
+                        text: (l.words || '').trim() || ' ', // Prevents crash on empty tags
+                        timeStamp: convertTimeTagToMs(l.timeTag)
+                    }))
+                }];
+            }
         }
 
-        // Create the raw ID3v2 header buffer instantly 
-        const id3HeaderBuffer = NodeID3.create(id3Tags);
+        // 4. Inject Tags perfectly into the file (Guarantees no double-tag corruption)
+        NodeID3.write(id3Tags, tmpAudioPath);
 
-        // --- INSTANT STREAMING ---
-        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-        res.setHeader('Pragma', 'no-cache');
-        res.setHeader('Expires', '0');
+        // 5. Read the final file size
+        const stat = fs.statSync(tmpAudioPath);
+
+        // --- SEND THE FILE ---
+        // Setting Content-Length is what fixes the missing timeline duration bug!
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.setHeader('Content-Length', stat.size);
         res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // Send the perfectly formatted node-id3 buffer first
-        res.write(id3HeaderBuffer);
+        const readStream = fs.createReadStream(tmpAudioPath);
+        readStream.pipe(res);
 
-        // Run FFmpeg just to handle the raw audio decoding (Exactly as your original working code)
-        ffmpeg(url)
-            .outputOptions([
-                '-vn',                   // Skip cover art in FFmpeg (Handled by ID3)
-                '-f', 'mp3',             // Force raw MP3 stream out
-                '-c:a', 'libmp3lame',    // MP3 encoder
-                '-b:a', targetBitrate,   // Quality enforcement
-                '-map_metadata', '-1',   // Prevent FFmpeg from overwriting our ID3 metadata
-                '-threads', '0'          // Multi-threading
-            ])
-            .on('error', (err) => {
-                console.error('FFmpeg Error:', err.message);
-                if (!res.writableEnded) res.end();
-            })
-            .pipe(res, { end: true });
+        // Cleanup temporary memory once file is safely sent
+        readStream.on('close', () => {
+            try { fs.unlinkSync(tmpAudioPath); } catch (e) {}
+        });
+        readStream.on('error', () => {
+            try { fs.unlinkSync(tmpAudioPath); } catch (e) {}
+        });
 
     } catch (err) {
+        console.error('API Error:', err);
         if (!res.headersSent) {
             res.status(500).json({ error: "API Crashed", details: err.message });
         } else {
