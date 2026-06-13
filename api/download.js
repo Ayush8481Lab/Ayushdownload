@@ -31,14 +31,9 @@ module.exports = async (req, res) => {
         
         const outputFormat = 'mp3'; 
         
-        // --- FILENAME FIX FOR WINDOWS (" to _ ISSUE) ---
-        // We replace standard ASCII quotes (") with identical Unicode Typographical Quotes (“ ”).
-        // Windows allows Unicode quotes, preventing the browser from mangling them into underscores!
-        const safeFileName = songTitle
-            .replace(/"([^"]*)"/g, '“$1”') // Converts: (From "Dhurandhar") -> (From “Dhurandhar”)
-            .replace(/"/g, '”')            // Catches any leftover single unclosed quotes
-            .replace(/[/\\:*?<>|]/g, "")   // Strips actual strict illegal path chars
-            .trim() || "audio_download";
+        // FILENAME FIX: Removed `"` from the regex so double quotes are preserved.
+        // We only strip characters that fatally break file paths (/ \ : * ? < > |)
+        const safeFileName = songTitle.replace(/[/\\:*?<>|]/g, "").trim() || "audio_download";
 
         // DYNAMIC QUALITY EXTRACTOR
         let targetBitrate = '320k'; 
@@ -70,10 +65,10 @@ module.exports = async (req, res) => {
 
         // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION ---
         const id3Tags = {
-            title: songTitle, // Internal metadata safely keeps the standard `"` 
+            title: songTitle,
             artist: songArtist,
             album: songAlbum,
-            performerInfo: songArtist
+            performerInfo: songArtist // Maps to Album Artist
         };
 
         if (imageBuffer) {
@@ -93,8 +88,10 @@ module.exports = async (req, res) => {
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
         
-        // Prepare perfect UTF-8 URL encoded name for the header
-        const fallbackName = safeFileName.replace(/[“”]/g, "''"); // Fallback for very old systems using two single quotes
+        // FILENAME FIX: 
+        // 1. Fallback name replaces `"` with `'` because raw double quotes break the HTTP header syntax (filename="...").
+        // 2. encodedName perfectly preserves `"` as `%22`, allowing modern browsers to parse it as exactly what you want.
+        const fallbackName = safeFileName.replace(/"/g, "'");
         const encodedName = encodeURIComponent(safeFileName);
 
         res.setHeader('Content-Disposition', `attachment; filename="${fallbackName}.${outputFormat}"; filename*=UTF-8''${encodedName}.${outputFormat}`);
