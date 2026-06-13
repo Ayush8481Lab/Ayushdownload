@@ -31,8 +31,9 @@ module.exports = async (req, res) => {
         
         const outputFormat = 'mp3'; 
         
-        // FILENAME FIX: Kept spaces and text intact, only removed illegal file system characters.
-        const safeFileName = songTitle.replace(/["/\\:*?<>|]/g, "").trim() || "audio_download";
+        // FILENAME FIX: Removed `"` from the regex so double quotes are preserved.
+        // We only strip characters that fatally break file paths (/ \ : * ? < > |)
+        const safeFileName = songTitle.replace(/[/\\:*?<>|]/g, "").trim() || "audio_download";
 
         // DYNAMIC QUALITY EXTRACTOR
         let targetBitrate = '320k'; 
@@ -62,7 +63,7 @@ module.exports = async (req, res) => {
             }
         }
 
-        // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION (NO LYRICS) ---
+        // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION ---
         const id3Tags = {
             title: songTitle,
             artist: songArtist,
@@ -79,7 +80,7 @@ module.exports = async (req, res) => {
             };
         }
 
-        // Create the raw ID3v2 header buffer instantly (ZERO disk I/O)
+        // Create the raw ID3v2 header buffer instantly
         const id3HeaderBuffer = NodeID3.create(id3Tags);
 
         // --- OPTIMIZATION 3: INSTANT STREAMING ---
@@ -87,35 +88,39 @@ module.exports = async (req, res) => {
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
         
-        // FILENAME FIX: Use UTF-8 Encoding in the header so browsers read plain-text spaces perfectly
-        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"; filename*=UTF-8''${encodeURIComponent(safeFileName)}.${outputFormat}`);
+        // FILENAME FIX: 
+        // 1. Fallback name replaces `"` with `'` because raw double quotes break the HTTP header syntax (filename="...").
+        // 2. encodedName perfectly preserves `"` as `%22`, allowing modern browsers to parse it as exactly what you want.
+        const fallbackName = safeFileName.replace(/"/g, "'");
+        const encodedName = encodeURIComponent(safeFileName);
+
+        res.setHeader('Content-Disposition', `attachment; filename="${fallbackName}.${outputFormat}"; filename*=UTF-8''${encodedName}.${outputFormat}`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // Send the ID3 Tag Header immediately so the client starts downloading instantly!
+        // Send the ID3 Tag Header immediately
         res.write(id3HeaderBuffer);
 
-        // Run FFmpeg & Pipe purely Raw Audio data right behind the ID3 tag
+        // Run FFmpeg & Pipe purely Raw Audio data
         ffmpeg(url)
             .outputOptions([
-                '-vn',                   // Skip cover art in FFmpeg (We already injected it in the ID3 Header!)
-                '-f', 'mp3',             // Force raw MP3 stream out
-                '-c:a', 'libmp3lame',    // MP3 encoder
-                '-b:a', targetBitrate,   // Quality enforcement
-                '-map_metadata', '-1',   // Strip original M3U8 metadata so it doesn't conflict with our ID3 header
-                '-threads', '0'          // Use all available CPU cores for decoding
+                '-vn',                   
+                '-f', 'mp3',             
+                '-c:a', 'libmp3lame',    
+                '-b:a', targetBitrate,   
+                '-map_metadata', '-1',   
+                '-threads', '0'          
             ])
             .on('error', (err) => {
                 console.error('FFmpeg Error:', err.message);
                 if (!res.writableEnded) res.end();
             })
-            // Pipes the audio chunks continuously, automatically closing the connection when done.
             .pipe(res, { end: true });
 
     } catch (err) {
         if (!res.headersSent) {
             res.status(500).json({ error: "API Crashed", details: err.message });
         } else {
-            res.end(); // Fail gracefully if stream already started
+            res.end(); 
         }
     }
 };
