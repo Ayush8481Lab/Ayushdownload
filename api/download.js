@@ -16,33 +16,23 @@ try {
     console.error("Failed to setup FFmpeg in /tmp:", error);
 }
 
-// Helper: Converts time string "01:25.97" into milliseconds (85970) for ID3 Sync
-const convertTimeTagToMs = (timeTag) => {
-    if (!timeTag) return 0;
-    const parts = timeTag.split(':');
-    if (parts.length >= 2) {
-        const minutes = parseInt(parts[0], 10);
-        const seconds = parseFloat(parts[1]);
-        return Math.floor((minutes * 60 + seconds) * 1000);
-    }
-    return 0;
-};
-
 module.exports = async (req, res) => {
     try {
-        let { url, format, imageUrl, title, tittle, artist, album, trackid } = req.query;
+        let { url, imageUrl, title, tittle, artist, album } = req.query;
 
         if (!url) return res.status(400).json({ error: "Missing M3U8 url parameter" });
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        // Clean out any special characters
+        // Clean out special characters that might break ID3 tags
         const cleanStr = (str) => String(str).replace(/[=;#\\\n]/g, "").trim();
         const songTitle = cleanStr(title || tittle || 'Unknown Title');
         const songArtist = cleanStr(artist || 'Unknown Artist');
         const songAlbum = cleanStr(album || 'Unknown Album');
         
-        const outputFormat = 'mp3'; // Force MP3 (ID3 tags only apply to MP3s)
-        const safeFileName = songTitle.replace(/[^a-zA-Z0-9 ]/g, "").trim().replace(/ /g, "_") || "audio_download";
+        const outputFormat = 'mp3'; 
+        
+        // FILENAME FIX: Kept spaces and text intact, only removed illegal file system characters.
+        const safeFileName = songTitle.replace(/["/\\:*?<>|]/g, "").trim() || "audio_download";
 
         // DYNAMIC QUALITY EXTRACTOR
         let targetBitrate = '320k'; 
@@ -51,45 +41,28 @@ module.exports = async (req, res) => {
             targetBitrate = `${qualityMatch[1]}k`; 
         }
 
-        // --- OPTIMIZATION 1: PARALLEL NETWORK REQUESTS ---
-        const fetchTasks = [];
+        // --- OPTIMIZATION 1: FETCH IMAGE FAST ---
         let imageBuffer = null;
         let imageMime = 'image/jpeg';
-        let lyricsData = null;
 
-        // Task A: Fetch Image
         if (imageUrl) {
             if (!imageUrl.startsWith('http')) imageUrl = 'https://' + imageUrl;
-            fetchTasks.push(
-                fetch(imageUrl, { headers: { "User-Agent": "Mozilla/5.0" } })
-                    .then(async imgRes => {
-                        if (imgRes.ok) {
-                            const contentType = imgRes.headers.get('content-type') || '';
-                            if (contentType.includes('webp')) imageMime = 'image/webp';
-                            else if (contentType.includes('png')) imageMime = 'image/png';
-                            
-                            const arrayBuf = await imgRes.arrayBuffer();
-                            imageBuffer = Buffer.from(arrayBuf);
-                        }
-                    }).catch(e => console.error("Image fetch failed", e))
-            );
+            try {
+                const imgRes = await fetch(imageUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+                if (imgRes.ok) {
+                    const contentType = imgRes.headers.get('content-type') || '';
+                    if (contentType.includes('webp')) imageMime = 'image/webp';
+                    else if (contentType.includes('png')) imageMime = 'image/png';
+                    
+                    const arrayBuf = await imgRes.arrayBuffer();
+                    imageBuffer = Buffer.from(arrayBuf);
+                }
+            } catch (e) {
+                console.error("Image fetch failed", e);
+            }
         }
 
-        // Task B: Fetch Lyrics
-        if (trackid) {
-            const lyricsUrl = `https://lyr-nine.vercel.app/api/lyrics?url=https://open.spotify.com/track/${trackid}&format=lrc`;
-            fetchTasks.push(
-                fetch(lyricsUrl)
-                    .then(async lyrRes => {
-                        if (lyrRes.ok) lyricsData = await lyrRes.json();
-                    }).catch(e => console.error("Lyrics fetch failed", e))
-            );
-        }
-
-        // Wait for BOTH tasks concurrently (Cuts idle waiting time in half)
-        await Promise.all(fetchTasks);
-
-        // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION ---
+        // --- OPTIMIZATION 2: IN-MEMORY ID3 CONSTRUCTION (NO LYRICS) ---
         const id3Tags = {
             title: songTitle,
             artist: songArtist,
@@ -106,26 +79,6 @@ module.exports = async (req, res) => {
             };
         }
 
-        if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
-            const rawText = lyricsData.lines.map(l => l.words).join('\n');
-            
-            if (lyricsData.syncType === "LINE_SYNCED") {
-                id3Tags.synchronisedLyrics = [{
-                    language: 'eng',
-                    timeStampFormat: 2,
-                    contentType: 1,
-                    synchronisedText: lyricsData.lines.map(l => ({
-                        text: l.words,
-                        timeStamp: convertTimeTagToMs(l.timeTag)
-                    }))
-                }];
-            }
-            id3Tags.unsynchronisedLyrics = {
-                language: 'eng',
-                text: rawText
-            };
-        }
-
         // Create the raw ID3v2 header buffer instantly (ZERO disk I/O)
         const id3HeaderBuffer = NodeID3.create(id3Tags);
 
@@ -133,10 +86,12 @@ module.exports = async (req, res) => {
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
-        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"`);
+        
+        // FILENAME FIX: Use UTF-8 Encoding in the header so browsers read plain-text spaces perfectly
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFileName}.${outputFormat}"; filename*=UTF-8''${encodeURIComponent(safeFileName)}.${outputFormat}`);
         res.setHeader('Content-Type', 'audio/mpeg');
 
-        // Send the ID3 Tag Header immediately so the client starts downloading < 1 second!
+        // Send the ID3 Tag Header immediately so the client starts downloading instantly!
         res.write(id3HeaderBuffer);
 
         // Run FFmpeg & Pipe purely Raw Audio data right behind the ID3 tag
